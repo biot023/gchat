@@ -1,0 +1,3 @@
+@term=./tmp/term.log
+@src=./src
+@rs_flies=./src/**/*rs

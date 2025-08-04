@@ -1,0 +1,313 @@
+use clap::Parser;
+use notify::{recommended_watcher, RecursiveMode, Watcher, Event};
+use notify::Result as NotifyResult;
+use regex::Regex;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::env;
+use std::fs::{self, File};
+use std::io::{self, BufRead, Write as IoWrite};
+use std::fmt::Write as FmtWrite;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, mpsc::{channel, Receiver}};
+use std::time::Duration;
+use tokio::time::sleep;
+use walkdir::WalkDir;
+use glob::glob;
+
+#[derive(Parser, Debug)]
+#[command(version, about)]
+struct Args {
+    #[arg(long, default_value = "./g4a-placeholders")]
+    placeholders_file: String,
+
+    #[arg(long, default_value = "g4a-chat.md")]
+    chat_file: String,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct Message {
+    role: String,
+    content: String,
+}
+
+#[derive(Serialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<Message>,
+    temperature: f32,
+    max_tokens: u32,
+    stream: bool,
+}
+
+#[derive(Deserialize)]
+struct ChatResponse {
+    choices: Vec<Choice>,
+}
+
+#[derive(Deserialize)]
+struct Choice {
+    message: Message,
+    finish_reason: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> io::Result<()> {
+    let args = Args::parse();
+    let placeholders_path = PathBuf::from(&args.placeholders_file);
+    let chat_path = PathBuf::from(&args.chat_file);
+
+    let shorthands = load_placeholders(&placeholders_path)?;
+
+    let ignoring_next_change = Arc::new(Mutex::new(false));
+
+    let ignoring_clone = ignoring_next_change.clone();
+    let chat_path_clone = chat_path.clone();
+    let shorthands_clone = shorthands.clone();
+
+    // Initial process on startup
+    if let Err(e) = process_chat_file(
+        &chat_path_clone,
+        &shorthands_clone,
+        &ignoring_clone,
+    )
+    .await
+    {
+        println!("Initial processing error: {}", e);
+    }
+
+    // Set up watcher
+    let (tx, rx): (std::sync::mpsc::Sender<NotifyResult<Event>>, Receiver<NotifyResult<Event>>) = channel();
+    let mut watcher = recommended_watcher(move |res| { let _ = tx.send(res); })
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    watcher.watch(&chat_path_clone, RecursiveMode::NonRecursive)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    loop {
+        if let Ok(res) = rx.recv() {
+            match res {
+                Ok(event) if event.kind.is_modify() => {
+                    // Debounce
+                    sleep(Duration::from_millis(500)).await;
+
+                    // Check if ignoring
+                    let mut ignore = ignoring_clone.lock().unwrap();
+                    if *ignore {
+                        *ignore = false;
+                        continue;
+                    }
+
+                    if let Err(e) = process_chat_file(
+                        &chat_path_clone,
+                        &shorthands_clone,
+                        &ignoring_clone,
+                    )
+                    .await
+                    {
+                        println!("Processing error: {}", e);
+                    }
+                }
+                Ok(_) => {}, // Ignore other kinds
+                Err(e) => println!("Watcher error: {}", e),
+            }
+        } else {
+            break; // Channel closed
+        }
+    }
+
+    Ok(())
+}
+
+async fn process_chat_file(
+    chat_path: &PathBuf,
+    shorthands: &HashMap<String, String>,
+    ignoring_next_change: &Arc<Mutex<bool>>,
+) -> io::Result<()> {
+    let content = fs::read_to_string(chat_path)?;
+    let mut messages = parse_chat_messages(&content);
+
+    if messages.is_empty() || messages.last().unwrap().role != "user" {
+        return Ok(()); // No send needed
+    }
+
+    // Expand placeholders in all messages
+    for msg in messages.iter_mut() {
+        msg.content = expand_placeholders(&msg.content, shorthands)?;
+    }
+
+    println!("Sending to API: {:?}", messages);
+
+    // Send to API
+    let api_key = env::var("XAI_API_KEY").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "XAI_API_KEY not set"))?;
+    let client = Client::builder()
+        .timeout(Duration::from_secs(60))  // 60s timeout to prevent hangs
+        .build()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let req = ChatRequest {
+        model: "grok-4".to_string(),
+        messages,
+        temperature: 1.0,
+        max_tokens: 4096,
+        stream: true,
+    };
+
+    let res = client
+        .post("https://api.x.ai/v1/chat/completions")
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&req)
+        .send()
+        .await;
+
+    match res {
+        Ok(resp) if resp.status().is_success() => {
+            let chat_resp: ChatResponse = resp.json().await.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let assistant_content = chat_resp.choices[0].message.content.clone();
+            if let Some(reason) = &chat_resp.choices[0].finish_reason {
+                if reason == "length" {
+                    println!("Warning: Response truncated due to max_tokens limit!");
+                    // Optionally append a note to the chat file: "... [truncated]"
+                }
+            }
+            println!("Received from API: {}", assistant_content);
+
+            // Append to file
+            let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
+            writeln!(file, "\nGROK RESPONSE:\n{}\nUSER PROMPT:\n", assistant_content)?;
+
+            // Set ignore flag
+            *ignoring_next_change.lock().unwrap() = true;
+
+            Ok(())
+        }
+        Ok(resp) => {
+            let err_body = resp.text().await.unwrap_or_default();
+            Err(io::Error::new(io::ErrorKind::Other, format!("API error: {}", err_body)))
+        }
+        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+    }
+}
+
+fn parse_chat_messages(content: &str) -> Vec<Message> {
+    let mut messages = Vec::new();
+    let parts: Vec<&str> = content.split("\nGROK RESPONSE:\n").collect();
+
+    for (i, part) in parts.iter().enumerate() {
+        if i == 0 {
+            let trimmed = part.trim();
+            if !trimmed.is_empty() {
+                messages.push(Message { role: "user".to_string(), content: trimmed.to_string() });
+            }
+        } else {
+            let subparts: Vec<&str> = part.split("\nUSER PROMPT:\n").collect();
+            for (j, sub) in subparts.iter().enumerate() {
+                let trimmed = sub.trim();
+                if !trimmed.is_empty() {
+                    let role = if j == 0 { "assistant" } else { "user" };
+                    messages.push(Message { role: role.to_string(), content: trimmed.to_string() });
+                }
+            }
+        }
+    }
+    messages
+}
+
+fn load_placeholders(path: &PathBuf) -> io::Result<HashMap<String, String>> {
+    let mut shorthands = HashMap::new();
+    if path.exists() {
+        let file = File::open(path)?;
+        for line in io::BufReader::new(file).lines() {
+            let line = line?;
+            let trimmed = line.trim();
+            if trimmed.starts_with('@') {
+                if let Some(eq_pos) = trimmed.find('=') {
+                    let key = trimmed[1..eq_pos].trim().to_string();
+                    let value = trimmed[eq_pos + 1..].trim().to_string();
+                    shorthands.insert(key, value);
+                }
+            }
+        }
+    }
+    Ok(shorthands)
+}
+
+fn expand_placeholders(text: &str, shorthands: &HashMap<String, String>) -> io::Result<String> {
+    let re = Regex::new(r"@(\w+)|@f:([^@]+)|@d:([^@]+)").unwrap();
+    let mut result = String::new();
+    let mut last_end = 0;
+
+    for cap in re.captures_iter(text) {
+        let match_start = cap.get(0).unwrap().start();
+        result.push_str(&text[last_end..match_start]);
+
+        if let Some(shorthand) = cap.get(1) {
+            if let Some(path) = shorthands.get(shorthand.as_str()) {
+                result.push_str(&expand_file_path(path)?);
+            }
+        } else if let Some(file_path) = cap.get(2) {
+            result.push_str(&expand_file_path(file_path.as_str())?);
+        } else if let Some(dir_path) = cap.get(3) {
+            result.push_str(&expand_dir_tree(dir_path.as_str())?);
+        }
+
+        last_end = cap.get(0).unwrap().end();
+    }
+
+    result.push_str(&text[last_end..]);
+    Ok(result)
+}
+
+fn expand_file_path(path_str: &str) -> io::Result<String> {
+    let path = Path::new(path_str);
+    let mut output = String::new();
+
+    if path_str.contains('*') || path_str.contains('?') {
+        // Glob
+        let mut paths: Vec<_> = glob(path_str).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?.filter_map(Result::ok).collect();
+        paths.sort();
+        for p in paths {
+            if p.is_file() {
+                let content = fs::read_to_string(&p)?;
+                writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", p.display(), content).expect("Failed to write to String");
+            }
+        }
+    } else if path.is_dir() {
+        // Directory recurse
+        let mut entries: Vec<_> = WalkDir::new(path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).collect();
+        entries.sort_by_key(|e| e.path().to_owned());
+        for entry in entries {
+            let content = fs::read_to_string(entry.path())?;
+            writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", entry.path().display(), content).expect("Failed to write to String");
+        }
+    } else if path.is_file() {
+        // Single file
+        let content = fs::read_to_string(path)?;
+        writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", path.display(), content).expect("Failed to write to String");
+    }
+
+    Ok(output)
+}
+
+fn expand_dir_tree(path_str: &str) -> io::Result<String> {
+    let path = Path::new(path_str);
+    if !path.is_dir() {
+        return Ok(String::new());
+    }
+
+    let mut output = format!("Contents of directory {}:\n```\n", path.display());
+    let mut entries: Vec<_> = WalkDir::new(path).min_depth(1).into_iter().filter_map(|e| e.ok()).collect();
+    entries.sort_by_key(|e| e.path().to_owned());
+
+    for entry in entries {
+        let rel_path = entry.path().strip_prefix(path).unwrap();
+        let indent = "  ".repeat(entry.depth() - 1);
+        if entry.file_type().is_dir() {
+            writeln!(&mut output, "{}{}/", indent, rel_path.display()).expect("Failed to write to String");
+        } else {
+            writeln!(&mut output, "{}{}", indent, rel_path.display()).expect("Failed to write to String");
+        }
+    }
+    output.push_str("```\n");
+    Ok(output)
+}
