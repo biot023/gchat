@@ -28,6 +28,9 @@ struct Args {
 
     #[arg(long, default_value = "g4a-chat.md")]
     chat_file: String,
+
+    #[arg(long, default_value = "4096")]
+    max_tokens: u32,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -63,8 +66,7 @@ async fn main() -> io::Result<()> {
 
     // Create placeholders file if it doesn't exist
     if !placeholders_path.exists() {
-        let mut file = File::create(&placeholders_path)?;
-        writeln!(file, "{}:\n", USER_PROMPT_MARKER)?;
+        File::create(&chat_path)?;
         println!(
             "Created placeholders file at {}. You can populate it with shorthands like @key = path/to/file_or_dir",
             placeholders_path.display()
@@ -73,7 +75,8 @@ async fn main() -> io::Result<()> {
 
     // Create chat file if it doesn't exist
     if !chat_path.exists() {
-        File::create(&chat_path)?;
+        let mut file = File::create(&chat_path)?;
+        writeln!(file, "{}:\n", USER_PROMPT_MARKER)?;
         println!(
             "Created chat file at {}. Start your conversation by adding:\n{}:\nYour prompt here\n",
             chat_path.display(), USER_PROMPT_MARKER
@@ -81,6 +84,21 @@ async fn main() -> io::Result<()> {
     }
 
     let shorthands = load_placeholders(&placeholders_path)?;
+
+    // Print settings and placeholders on startup
+    println!("Running with settings:");
+    println!("  Placeholders file: {}", args.placeholders_file);
+    println!("  Chat file: {}", args.chat_file);
+    println!("  Max tokens: {}", args.max_tokens);
+
+    println!("Registered placeholders:");
+    if shorthands.is_empty() {
+        println!("  (None)");
+    } else {
+        for (key, value) in &shorthands {
+            println!("  @{} = {}", key, value);
+        }
+    }
 
     let ignoring_next_change = Arc::new(Mutex::new(false));
 
@@ -93,6 +111,7 @@ async fn main() -> io::Result<()> {
     // Initial process on startup
     if let Err(e) = process_chat_file(
         &chat_path_clone,
+        args.max_tokens,
         &shorthands_clone,
         &ignoring_clone,
     )
@@ -124,6 +143,7 @@ async fn main() -> io::Result<()> {
 
                     if let Err(e) = process_chat_file(
                         &chat_path_clone,
+                        args.max_tokens,
                         &shorthands_clone,
                         &ignoring_clone,
                     )
@@ -145,6 +165,7 @@ async fn main() -> io::Result<()> {
 
 async fn process_chat_file(
     chat_path: &PathBuf,
+    max_tokens: u32,
     shorthands: &HashMap<String, String>,
     ignoring_next_change: &Arc<Mutex<bool>>,
 ) -> io::Result<()> {
@@ -177,7 +198,7 @@ async fn process_chat_file(
         model: "grok-4-0709".to_string(),
         messages,
         temperature: 1.0,
-        max_tokens: 4096,
+        max_tokens,
     };
 
     // Build the request but don't send yet
