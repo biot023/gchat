@@ -38,7 +38,6 @@ struct ChatRequest {
     messages: Vec<Message>,
     temperature: f32,
     max_tokens: u32,
-    stream: bool,
 }
 
 #[derive(Deserialize)]
@@ -149,7 +148,6 @@ async fn process_chat_file(
         messages,
         temperature: 1.0,
         max_tokens: 4096,
-        stream: true,
     };
 
     let res = client
