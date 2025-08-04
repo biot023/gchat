@@ -23,13 +23,13 @@ const THINKING_MESSAGE: &str = "Grok is thinking...";
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    #[arg(long, default_value = "./g4a-placeholders")]
+    #[arg(short, long, default_value = "./g4a-placeholders")]
     placeholders_file: String,
 
-    #[arg(long, default_value = "g4a-chat.md")]
+    #[arg(short, long, default_value = "./g4a-chat.md")]
     chat_file: String,
 
-    #[arg(long, default_value = "4096")]
+    #[arg(short = 't', long, default_value = "4096")]
     max_tokens: u32,
 }
 
@@ -191,7 +191,7 @@ async fn process_chat_file(
     // Get API key, build client, create req (unchanged)
     let api_key = env::var("XAI_API_KEY").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "XAI_API_KEY not set"))?;
     let client = Client::builder()
-        .timeout(Duration::from_secs(240))  // 60s timeout to prevent hangs
+        .timeout(Duration::from_secs(600))
         .build()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let req = ChatRequest {
