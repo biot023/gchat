@@ -61,6 +61,25 @@ async fn main() -> io::Result<()> {
     let placeholders_path = PathBuf::from(&args.placeholders_file);
     let chat_path = PathBuf::from(&args.chat_file);
 
+    // Create placeholders file if it doesn't exist
+    if !placeholders_path.exists() {
+        let mut file = File::create(&chat_path)?;
+        writeln!(file, "{}:\n", USER_PROMPT_MARKER)?;
+        println!(
+            "Created placeholders file at {}. You can populate it with shorthands like @key = path/to/file_or_dir",
+            placeholders_path.display()
+        );
+    }
+
+    // Create chat file if it doesn't exist
+    if !chat_path.exists() {
+        File::create(&chat_path)?;
+        println!(
+            "Created chat file at {}. Start your conversation by adding:\n{}:\nYour prompt here\n",
+            chat_path.display(), USER_PROMPT_MARKER
+        );
+    }
+
     let shorthands = load_placeholders(&placeholders_path)?;
 
     let ignoring_next_change = Arc::new(Mutex::new(false));

@@ -13,3 +13,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.38", features = ["full"] }
 regex = "1.10"
+
+[[bin]]
+name = "grok-4-assistant"
+path = "src/main.rs"
