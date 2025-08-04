@@ -13,6 +13,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.38", features = ["full"] }
 regex = "1.10"
+rodio = "0.17.3"  # For audio playback
 
 [[bin]]
 name = "grok-4-assistant"

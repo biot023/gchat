@@ -15,6 +15,8 @@ use std::time::Duration;
 use tokio::time::sleep;
 use walkdir::WalkDir;
 use glob::glob;
+use rodio::{OutputStream, Sink, Source, source::SineWave};
+use std::time::Duration as StdDuration;
 
 const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
@@ -31,6 +33,9 @@ struct Args {
 
     #[arg(short = 't', long, default_value = "4096")]
     max_tokens: u32,
+
+    #[arg(short = 'T', long, default_value = "600")]
+    api_timeout: u64,
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -90,6 +95,7 @@ async fn main() -> io::Result<()> {
     println!("  Placeholders file: {}", args.placeholders_file);
     println!("  Chat file: {}", args.chat_file);
     println!("  Max tokens: {}", args.max_tokens);
+    println!("  API timeout: {} seconds", args.api_timeout);
 
     println!("Registered placeholders:");
     if shorthands.is_empty() {
@@ -112,12 +118,13 @@ async fn main() -> io::Result<()> {
     if let Err(e) = process_chat_file(
         &chat_path_clone,
         args.max_tokens,
+        args.api_timeout,
         &shorthands_clone,
         &ignoring_clone,
     )
     .await
     {
-        println!("Initial processing error: {}", e);
+        println!("Processing error: {}", e);
     }
 
     // Set up watcher
@@ -144,6 +151,7 @@ async fn main() -> io::Result<()> {
                     if let Err(e) = process_chat_file(
                         &chat_path_clone,
                         args.max_tokens,
+                        args.api_timeout,
                         &shorthands_clone,
                         &ignoring_clone,
                     )
@@ -166,6 +174,7 @@ async fn main() -> io::Result<()> {
 async fn process_chat_file(
     chat_path: &PathBuf,
     max_tokens: u32,
+    api_timeout: u64,
     shorthands: &HashMap<String, String>,
     ignoring_next_change: &Arc<Mutex<bool>>,
 ) -> io::Result<()> {
@@ -191,7 +200,7 @@ async fn process_chat_file(
     // Get API key, build client, create req (unchanged)
     let api_key = env::var("XAI_API_KEY").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "XAI_API_KEY not set"))?;
     let client = Client::builder()
-        .timeout(Duration::from_secs(600))
+        .timeout(Duration::from_secs(api_timeout))
         .build()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let req = ChatRequest {
@@ -238,6 +247,9 @@ async fn process_chat_file(
                 USER_PROMPT_MARKER
             )?;
 
+            // Play chime sound
+            play_chime().await;
+
             // Set ignore flag
             *ignoring_next_change.lock().unwrap() = true;
 
@@ -246,9 +258,15 @@ async fn process_chat_file(
         Ok(resp) => {
             let status = resp.status();
             let err_body = resp.text().await.unwrap_or_default();
+            println!("Grok failed to respond.");
+            play_warning().await;
             Err(io::Error::new(io::ErrorKind::Other, format!("API error: {} - Body: {}", status, err_body)))
         }
-        Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("Request error: {:?}", e))),
+        Err(e) => {
+            println!("Grok failed to respond.");
+            play_warning().await;
+            Err(io::Error::new(io::ErrorKind::Other, format!("Request error: {:?}", e)))
+        },
     }
 }
 
@@ -303,22 +321,37 @@ fn expand_placeholders(text: &str, shorthands: &HashMap<String, String>) -> io::
     let mut result = String::new();
     let mut last_end = 0;
 
-
     for cap in re.captures_iter(text) {
-        let match_start = cap.get(0).unwrap().start();
+        let match_range = cap.get(0).unwrap();
+        let placeholder = match_range.as_str();
+        let match_start = match_range.start();
         result.push_str(&text[last_end..match_start]);
 
         if let Some(file_path) = cap.get(1) {
-            result.push_str(&expand_file_path(file_path.as_str())?);
+            let path_str = file_path.as_str();
+            let expanded = expand_file_path(path_str)
+                .map_err(|e| io::Error::new(e.kind(), format!("Error: Failed to expand file placeholder '{}': {} (path: {})", placeholder, e, path_str)))?;
+            result.push_str(&expanded);
         } else if let Some(dir_path) = cap.get(2) {
-            result.push_str(&expand_dir_tree(dir_path.as_str())?);
+            let path_str = dir_path.as_str();
+            let expanded = expand_dir_tree(path_str)
+                .map_err(|e| io::Error::new(e.kind(), format!("Error: Failed to expand directory placeholder '{}': {} (path: {})", placeholder, e, path_str)))?;
+            result.push_str(&expanded);
         } else if let Some(shorthand) = cap.get(3) {
-            if let Some(path) = shorthands.get(shorthand.as_str()) {
-                result.push_str(&expand_file_path(path)?);
+            let shorthand_key = shorthand.as_str();
+            if let Some(path) = shorthands.get(shorthand_key) {
+                let expanded = expand_file_path(path)
+                    .map_err(|e| io::Error::new(e.kind(), format!("Error: Failed to expand shorthand placeholder '{}' (resolved to '{}'): {}", placeholder, path, e)))?;
+                result.push_str(&expanded);
+            } else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Error: Placeholder '{}' not found in shorthands", placeholder)
+                ));
             }
         }
 
-        last_end = cap.get(0).unwrap().end();
+        last_end = match_range.end();
     }
 
     result.push_str(&text[last_end..]);
@@ -332,8 +365,14 @@ fn expand_file_path(path_str: &str) -> io::Result<String> {
     if path_str.contains('*') || path_str.contains('?') {
         // Glob
         let mut paths: Vec<_> = glob(path_str).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?.filter_map(Result::ok).collect();
+        if paths.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "No files matched the glob pattern"));
+        }
         paths.sort();
         for p in paths {
+            if !p.exists() {
+                return Err(io::Error::new(io::ErrorKind::NotFound, format!("File not found: {}", p.display())));
+            }
             if p.is_file() {
                 let content = fs::read_to_string(&p)?;
                 writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", p.display(), content).expect("Failed to write to String");
@@ -341,14 +380,30 @@ fn expand_file_path(path_str: &str) -> io::Result<String> {
         }
     } else if path.is_dir() {
         // Directory recurse
+        if !path.exists() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "Directory not found"));
+        }
         let mut entries: Vec<_> = WalkDir::new(path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).collect();
+        if entries.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "No files found in directory"));
+        }
         entries.sort_by_key(|e| e.path().to_owned());
         for entry in entries {
-            let content = fs::read_to_string(entry.path())?;
-            writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", entry.path().display(), content).expect("Failed to write to String");
+            let entry_path = entry.path();
+            if !entry_path.exists() {
+                return Err(io::Error::new(io::ErrorKind::NotFound, format!("File not found in directory: {}", entry_path.display())));
+            }
+            let content = fs::read_to_string(entry_path)?;
+            writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", entry_path.display(), content).expect("Failed to write to String");
         }
-    } else if path.is_file() {
+    } else {
         // Single file
+        if !path.exists() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "File not found"));
+        }
+        if !path.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Path is not a file"));
+        }
         let content = fs::read_to_string(path)?;
         writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", path.display(), content).expect("Failed to write to String");
     }
@@ -358,23 +413,69 @@ fn expand_file_path(path_str: &str) -> io::Result<String> {
 
 fn expand_dir_tree(path_str: &str) -> io::Result<String> {
     let path = Path::new(path_str);
+    if !path.exists() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "Directory not found"));
+    }
     if !path.is_dir() {
-        return Ok(String::new());
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Path is not a directory"));
     }
 
     let mut output = format!("Contents of directory {}:\n```\n", path.display());
     let mut entries: Vec<_> = WalkDir::new(path).min_depth(1).into_iter().filter_map(|e| e.ok()).collect();
-    entries.sort_by_key(|e| e.path().to_owned());
-
-    for entry in entries {
-        let rel_path = entry.path().strip_prefix(path).unwrap();
-        let indent = "  ".repeat(entry.depth() - 1);
-        if entry.file_type().is_dir() {
-            writeln!(&mut output, "{}{}/", indent, rel_path.display()).expect("Failed to write to String");
-        } else {
-            writeln!(&mut output, "{}{}", indent, rel_path.display()).expect("Failed to write to String");
+    if entries.is_empty() {
+        output.push_str("(empty directory)\n");
+    } else {
+        entries.sort_by_key(|e| e.path().to_owned());
+        for entry in entries {
+            let rel_path = entry.path().strip_prefix(path).unwrap();
+            let indent = "  ".repeat(entry.depth() - 1);
+            if entry.file_type().is_dir() {
+                writeln!(&mut output, "{}{}/", indent, rel_path.display()).expect("Failed to write to String");
+            } else {
+                writeln!(&mut output, "{}{}", indent, rel_path.display()).expect("Failed to write to String");
+            }
         }
     }
     output.push_str("```\n");
     Ok(output)
+}
+
+// Play a pleasant chime sound (ascending tones)
+async fn play_chime() {
+    tokio::task::spawn_blocking(|| {
+        let (_stream, stream_handle) = OutputStream::try_default().expect("Failed to get default output stream");
+        let sink = Sink::try_new(&stream_handle).expect("Failed to create sink");
+
+        // Chime: three ascending sine waves (e.g., 440Hz, 523Hz, 659Hz for A4, C5, E5 notes)
+        let frequencies = [440, 523, 659];
+        for freq in frequencies {
+            let source = SineWave::new(freq as f32).take_duration(StdDuration::from_millis(200)).amplify(0.20); // Short, soft tone
+            sink.append(source);
+            std::thread::sleep(StdDuration::from_millis(50)); // Small gap between tones
+        }
+
+        sink.sleep_until_end(); // Wait for playback to finish
+    })
+    .await
+    .expect("Failed to play chime");
+}
+
+// Play a warning sound (descending tones)
+async fn play_warning() {
+    tokio::task::spawn_blocking(|| {
+        let (_stream, stream_handle) = OutputStream::try_default().expect("Failed to get default output stream");
+        let sink = Sink::try_new(&stream_handle).expect("Failed to create sink");
+
+        // Warning: three descending sine waves (e.g., 659Hz, 523Hz, 440Hz for E5, C5, A4 notes)
+        let frequencies = [659, 523, 440];
+        for freq in frequencies {
+            let source = SineWave::new(freq as f32).take_duration(StdDuration::from_millis(200)).amplify(0.20); // Short, soft tone
+            sink.append(source);
+            std::thread::sleep(StdDuration::from_millis(50)); // Small gap between tones
+        }
+
+        sink.sleep_until_end(); // Wait for playback to finish
+    })
+    .await
+    .expect("Failed to play warning");
 }

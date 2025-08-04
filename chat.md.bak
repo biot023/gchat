@@ -1,0 +1,11 @@
+You are a Rust and Grok 4 expert helping me develop this utility to communicate with the Grok 4 API.
+The code for the utility is all in @f:./src/main.rs
+Please be mindful in your replies of the `max_tokens` value set in the `ChatRequest` struct.
+I don't require an initial analysis of the code, just confirmation that you have received this first message.
+
+
+GROK RESPONSE:
+Received and understood. Ready to assist with developing the utility.
+
+USER PROMPT:
+How does the project use this file: @f:./src/lib.rs ?
