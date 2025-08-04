@@ -16,6 +16,10 @@ use tokio::time::sleep;
 use walkdir::WalkDir;
 use glob::glob;
 
+const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
+const USER_PROMPT_MARKER: &str = "USER PROMPT";
+const THINKING_MESSAGE: &str = "Grok is thinking...";
+
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
@@ -64,6 +68,8 @@ async fn main() -> io::Result<()> {
     let ignoring_clone = ignoring_next_change.clone();
     let chat_path_clone = chat_path.clone();
     let shorthands_clone = shorthands.clone();
+
+    println!("App started. Watching {} for changes.", args.chat_file);
 
     // Initial process on startup
     if let Err(e) = process_chat_file(
@@ -126,37 +132,47 @@ async fn process_chat_file(
     let content = fs::read_to_string(chat_path)?;
     let mut messages = parse_chat_messages(&content);
 
+    println!("Parsed messages: {:?}", messages);
+
     if messages.is_empty() || messages.last().unwrap().role != "user" {
+        println!("No user prompt to process in chat file.");
         return Ok(()); // No send needed
     }
 
-    // Expand placeholders in all messages
+    // Expand placeholders ONLY in user messages (prompts to the API)
     for msg in messages.iter_mut() {
-        msg.content = expand_placeholders(&msg.content, shorthands)?;
+        if msg.role == "user" {
+            msg.content = expand_placeholders(&msg.content, shorthands)?;
+        }
     }
 
     println!("Sending to API: {:?}", messages);
 
-    // Send to API
+    // Get API key, build client, create req (unchanged)
     let api_key = env::var("XAI_API_KEY").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "XAI_API_KEY not set"))?;
     let client = Client::builder()
-        .timeout(Duration::from_secs(60))  // 60s timeout to prevent hangs
+        .timeout(Duration::from_secs(240))  // 60s timeout to prevent hangs
         .build()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
     let req = ChatRequest {
-        model: "grok-4".to_string(),
+        model: "grok-4-0709".to_string(),
         messages,
         temperature: 1.0,
         max_tokens: 4096,
     };
 
-    let res = client
+    // Build the request but don't send yet
+    let request_builder = client
         .post("https://api.x.ai/v1/chat/completions")
         .header("Content-Type", "application/json")
         .header("Authorization", format!("Bearer {}", api_key))
-        .json(&req)
-        .send()
-        .await;
+        .json(&req);
+
+    // Print thinking message
+    println!("{}", THINKING_MESSAGE);
+
+    // Now send and await
+    let res = request_builder.send().await;
 
     match res {
         Ok(resp) if resp.status().is_success() => {
@@ -172,7 +188,13 @@ async fn process_chat_file(
 
             // Append to file
             let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
-            writeln!(file, "\nGROK RESPONSE:\n{}\nUSER PROMPT:\n", assistant_content)?;
+            writeln!(
+                file,
+                "\n{}:\n{}\n\n{}:\n",
+                GROK_RESPONSE_MARKER,
+                assistant_content,
+                USER_PROMPT_MARKER
+            )?;
 
             // Set ignore flag
             *ignoring_next_change.lock().unwrap() = true;
@@ -180,16 +202,20 @@ async fn process_chat_file(
             Ok(())
         }
         Ok(resp) => {
+            let status = resp.status();
             let err_body = resp.text().await.unwrap_or_default();
-            Err(io::Error::new(io::ErrorKind::Other, format!("API error: {}", err_body)))
+            Err(io::Error::new(io::ErrorKind::Other, format!("API error: {} - Body: {}", status, err_body)))
         }
-        Err(e) => Err(io::Error::new(io::ErrorKind::Other, e)),
+        Err(e) => Err(io::Error::new(io::ErrorKind::Other, format!("Request error: {:?}", e))),
     }
 }
 
 fn parse_chat_messages(content: &str) -> Vec<Message> {
     let mut messages = Vec::new();
-    let parts: Vec<&str> = content.split("\nGROK RESPONSE:\n").collect();
+    let grok_marker_with_newlines = format!("\n{}:\n", GROK_RESPONSE_MARKER);
+    let user_marker_with_newlines = format!("\n{}:\n", USER_PROMPT_MARKER);
+
+    let parts: Vec<&str> = content.split(&grok_marker_with_newlines).collect();
 
     for (i, part) in parts.iter().enumerate() {
         if i == 0 {
@@ -198,7 +224,7 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
                 messages.push(Message { role: "user".to_string(), content: trimmed.to_string() });
             }
         } else {
-            let subparts: Vec<&str> = part.split("\nUSER PROMPT:\n").collect();
+            let subparts: Vec<&str> = part.split(&user_marker_with_newlines).collect();
             for (j, sub) in subparts.iter().enumerate() {
                 let trimmed = sub.trim();
                 if !trimmed.is_empty() {
@@ -231,28 +257,33 @@ fn load_placeholders(path: &PathBuf) -> io::Result<HashMap<String, String>> {
 }
 
 fn expand_placeholders(text: &str, shorthands: &HashMap<String, String>) -> io::Result<String> {
-    let re = Regex::new(r"@(\w+)|@f:([^@]+)|@d:([^@]+)").unwrap();
+    let re = Regex::new(r"@f\s*:(\S+)|@d\s*:(\S+)|@(\w+)").unwrap();
     let mut result = String::new();
     let mut last_end = 0;
 
+    println!(">>> TEXT: {:?}", text);
+
     for cap in re.captures_iter(text) {
+        println!(">>> CAP: {:?}", &cap);
         let match_start = cap.get(0).unwrap().start();
+        println!(">>> MATCH START: {:?}", match_start);
         result.push_str(&text[last_end..match_start]);
 
-        if let Some(shorthand) = cap.get(1) {
+        if let Some(file_path) = cap.get(1) {
+            result.push_str(&expand_file_path(file_path.as_str())?);
+        } else if let Some(dir_path) = cap.get(2) {
+            result.push_str(&expand_dir_tree(dir_path.as_str())?);
+        } else if let Some(shorthand) = cap.get(3) {
             if let Some(path) = shorthands.get(shorthand.as_str()) {
                 result.push_str(&expand_file_path(path)?);
             }
-        } else if let Some(file_path) = cap.get(2) {
-            result.push_str(&expand_file_path(file_path.as_str())?);
-        } else if let Some(dir_path) = cap.get(3) {
-            result.push_str(&expand_dir_tree(dir_path.as_str())?);
         }
 
         last_end = cap.get(0).unwrap().end();
     }
 
     result.push_str(&text[last_end..]);
+    println!(">>> RESULT: {:?}", result);
     Ok(result)
 }
 
