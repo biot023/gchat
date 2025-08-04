@@ -180,6 +180,7 @@ async fn process_chat_file(
             let assistant_content = chat_resp.choices[0].message.content.clone();
             if let Some(reason) = &chat_resp.choices[0].finish_reason {
                 if reason == "length" {
+                    println!("Grok has thought.");
                     println!("Warning: Response truncated due to max_tokens limit!");
                     // Optionally append a note to the chat file: "... [truncated]"
                 }
@@ -187,6 +188,7 @@ async fn process_chat_file(
             println!("Received from API: {}", assistant_content);
 
             // Append to file
+            println!("Grok has thought.");
             let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
             writeln!(
                 file,
