@@ -63,7 +63,7 @@ async fn main() -> io::Result<()> {
 
     // Create placeholders file if it doesn't exist
     if !placeholders_path.exists() {
-        let mut file = File::create(&chat_path)?;
+        let mut file = File::create(&placeholders_path)?;
         writeln!(file, "{}:\n", USER_PROMPT_MARKER)?;
         println!(
             "Created placeholders file at {}. You can populate it with shorthands like @key = path/to/file_or_dir",
@@ -282,12 +282,9 @@ fn expand_placeholders(text: &str, shorthands: &HashMap<String, String>) -> io::
     let mut result = String::new();
     let mut last_end = 0;
 
-    println!(">>> TEXT: {:?}", text);
 
     for cap in re.captures_iter(text) {
-        println!(">>> CAP: {:?}", &cap);
         let match_start = cap.get(0).unwrap().start();
-        println!(">>> MATCH START: {:?}", match_start);
         result.push_str(&text[last_end..match_start]);
 
         if let Some(file_path) = cap.get(1) {
@@ -304,7 +301,6 @@ fn expand_placeholders(text: &str, shorthands: &HashMap<String, String>) -> io::
     }
 
     result.push_str(&text[last_end..]);
-    println!(">>> RESULT: {:?}", result);
     Ok(result)
 }
 
