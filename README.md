@@ -9,7 +9,7 @@ An example of an opening prompt could be:
 ```md
 You are a Rust expert.
 You are assisting me in developing a Grok 4 chat utility.
-All the code for the project is here: @f./src/main.rs
+All the code for the project is here: @f:./src
 There is a media file: @d:./media
 The crates are detailed here: @f:.Cargo.toml
 
