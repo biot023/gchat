@@ -19,6 +19,7 @@ use log;  // New import for logging
 const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
 const THINKING_MESSAGE: &str = "Grok is thinking...";
+const MAX_LEVEL: u32 = 5; // Corresponds to L5 = 16384, as per original default
 
 #[derive(Parser, Debug)]
 #[command(version, about)]
@@ -26,8 +27,8 @@ struct Args {
     #[arg(short = 'f', long, default_value = "./gchat.md")]
     chat_file: String,
 
-    #[arg(short = 't', long, default_value = "16384")]
-    max_tokens: u32,
+    #[arg(short = 't', long, default_value = "L5")]
+    max_tokens: String,
 
     #[arg(short = 'T', long, default_value = "600")]
     api_timeout: u64,
@@ -63,6 +64,16 @@ async fn main() -> io::Result<()> {
     env_logger::init();  // Initialize logging (configure via RUST_LOG env var)
 
     let args = Args::parse();
+
+    // Parse the max_tokens level
+    let max_tokens = match parse_level(&args.max_tokens) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Error parsing --max-tokens: {}", e);
+            std::process::exit(1);
+        }
+    };
+
     let chat_path = PathBuf::from(&args.chat_file);
 
     // Create chat file if it doesn't exist
@@ -78,7 +89,7 @@ async fn main() -> io::Result<()> {
     // Print settings on startup
     println!("Running with settings:");
     println!("  Chat file: {}", args.chat_file);
-    println!("  Max tokens: {}", args.max_tokens);
+    println!("  Max tokens: {} ({})", args.max_tokens, max_tokens);
     println!("  API timeout: {} seconds", args.api_timeout);
 
     println!("App started. Polling {} for changes every 1 second.", args.chat_file);
@@ -86,7 +97,7 @@ async fn main() -> io::Result<()> {
     // Initial process on startup
     if let Err(e) = process_chat_file(
         &chat_path,
-        args.max_tokens,
+        max_tokens,
         args.api_timeout,
     )
     .await
@@ -117,7 +128,7 @@ async fn main() -> io::Result<()> {
             // File changed: process it
             if let Err(e) = process_chat_file(
                 &chat_path,
-                args.max_tokens,
+                max_tokens,
                 args.api_timeout,
             )
             .await
@@ -127,6 +138,24 @@ async fn main() -> io::Result<()> {
             // Update last mtime after processing
             last_mtime = current_mtime;
         }
+    }
+}
+
+fn parse_level(s: &str) -> Result<u32, String> {
+    let s = s.trim();
+    if let Some(lstr) = s.strip_prefix('L') {
+        match lstr.parse::<u32>() {
+            Ok(level) if level <= MAX_LEVEL => Ok(512u32 << level),
+            Ok(level) => Err(format!(
+                "Level too high: L{}, max L{} ({} tokens)",
+                level,
+                MAX_LEVEL,
+                512u32 << MAX_LEVEL
+            )),
+            Err(_) => Err("Invalid level: expected L followed by a number (e.g., L5)".to_string()),
+        }
+    } else {
+        Err("Invalid format: expected L<level> (e.g., L5)".to_string())
     }
 }
 
@@ -148,21 +177,19 @@ async fn process_chat_file(
 
     // Handle @t placeholders: remove from all user messages, and set local_max_tokens from the last @t in the last user message
     let mut local_max_tokens = max_tokens;
-    let re = Regex::new(r"@t\s*:\s*(\d+)").unwrap();
+    let re = Regex::new(r"@t\s*:\s*L(\d+)").unwrap();
     for i in 0..messages.len() {
         if messages[i].role == "user" {
             let content = &messages[i].content;
             let mut new_content = content.to_string();
-            let mut last_num: Option<u32> = None;
+            let mut last_level: Option<u32> = None;
             let mut ranges = vec![];
             for cap in re.captures_iter(content) {
                 let whole = cap.get(0).unwrap();
                 ranges.push(whole.range());
                 if let Some(num_str) = cap.get(1) {
-                    if let Ok(num) = num_str.as_str().parse::<u32>() {
-                        if num > 0 {
-                            last_num = Some(num);
-                        }
+                    if let Ok(lvl) = num_str.as_str().parse::<u32>() {
+                        last_level = Some(lvl);
                     }
                 }
             }
@@ -171,11 +198,21 @@ async fn process_chat_file(
                 new_content.replace_range(range, "");
             }
             messages[i].content = new_content;
-            // If this is the last message, apply the last_num if present
+            // If this is the last message, apply the last_level if present
             if i == messages.len() - 1 {
-                if let Some(num) = last_num {
-                    println!("Setting `max_tokens` API parameter to {}", num);
-                    local_max_tokens = num;
+                if let Some(lvl) = last_level {
+                    let mut effective_lvl = lvl;
+                    if effective_lvl > MAX_LEVEL {
+                        println!(
+                            "Warning: Specified level L{} too high, capping at L{} ({} tokens)",
+                            lvl,
+                            MAX_LEVEL,
+                            512u32 << MAX_LEVEL
+                        );
+                        effective_lvl = MAX_LEVEL;
+                    }
+                    local_max_tokens = 512u32 << effective_lvl;
+                    println!("Setting `max_tokens` API parameter to {}", local_max_tokens);
                 }
             }
         }
