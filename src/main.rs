@@ -1,4 +1,4 @@
-use clap::Parser;
+use clap::{Arg, Command};
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -14,116 +14,37 @@ use glob::glob;
 use rodio::{OutputStream, Sink, Source, source::SineWave, Decoder};
 use std::time::Duration as StdDuration;
 use std::io::Cursor;
-use log;  // New import for logging
+use log;
+use dirs;
+use toml;
 
 const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
-const MAX_LEVEL: u32 = 5; // Corresponds to L5 = 16384, as per original default
+const MAX_LEVEL: u32 = 5;
 
-// Add this constant for the system instructions
 const SYSTEM_INSTRUCTIONS: &str = r#"
 You are Grok, a helpful AI. If you need the contents of files to better answer the user's query, you can request them by responding with EXACTLY this format and NOTHING ELSE:
 GROK REQUESTS FILES: relative/path1, relative/path2
 Paths must be relative to the current working directory (e.g., src/main.rs, not /absolute/path or ../outside). Do not request files outside the project directory. You can request multiple files, directories, or globs (e.g., src/*.rs). The system will automatically include their contents in the next user message. Request all needed files at once if possible. You may request again if more are needed after seeing the contents.
 "#;
 
-#[derive(Parser, Debug)]
-#[command(
-    version,
-    about = "A utility to communicate with the Grok 4 API via a watched chat file.",
-    long_about = r#"
-A utility to communicate with the Grok 4 API by watching a Markdown chat file (default: ./gchat.md).
-The app polls the file every 1 second for changes. When a new user prompt is detected (marked by "USER PROMPT:"),
-it sends the conversation history to the Grok API, appends the response (marked by "GROK RESPONSE:"),
-and adds a new "USER PROMPT:" section for your next input. Plays a chime on success or a warning sound on failure.
+const DEFAULT_CHAT_FILE: &str = "./gchat.md";
+const DEFAULT_MAX_TOKENS: &str = "L3";
+const DEFAULT_TEMPERATURE: &str = "1.0";
+const DEFAULT_MODEL: &str = "grok-4";
+const DEFAULT_API_TIMEOUT: &str = "600";
+const DEFAULT_AUTO_REQUEST_FILES: bool = false;
+const DEFAULT_AUTO_INCREASE_MAX_TOKENS: bool = false;
 
-### Setup
-- Set the XAI_API_KEY environment variable with your Grok API key (e.g., export XAI_API_KEY=your_key).
-- Optionally, set RUST_LOG for logging (e.g., RUST_LOG=debug for detailed output, including API requests/responses).
-- Run the app: cargo run -- [options]. It runs indefinitely until killed (e.g., Ctrl+C).
-
-### Basic Usage
-1. Start the app. It creates ./gchat.md if it doesn't exist.
-2. Edit ./gchat.md in your text editor:
-   - Add your prompt under a "USER PROMPT:" marker.
-   - Save the file. The app detects the change, sends it to Grok, and appends the response.
-   - Example file content:
-     USER PROMPT:
-     Hello, Grok!
-
-     GROK RESPONSE:
-     Hello! How can I help?
-
-     USER PROMPT:
-     What's the weather like? (This will be sent next)
-3. The app processes only if the last section is a non-empty "USER PROMPT:".
-4. On startup, it processes any pending user prompt in the file.
-
-### Placeholders in User Prompts
-These are expanded ONLY in "USER PROMPT:" sections before sending to the API:
-- @f :path - Include file contents (e.g., @f :./file.txt). Supports globs (e.g., @f :./*.rs) or directories (recursively includes all files).
-- @d :path - Include directory tree listing (e.g., @d :./src). Shows files and subdirs recursively.
-- @t :L<level> - Set max_tokens for this prompt (e.g., @t :L3 for 4096 tokens). Removed after processing; last @t in the prompt wins. Levels: L0 (512) to L5 (16384).
-- @p :<value> - Set temperature for this prompt (e.g., @p :0.9 for temperature=0.9). Removed after processing; last @p in the prompt wins. Value is a float (e.g., 0.0 to 2.0).
-
-Placeholders are removed/expanded before API calls. Warnings are printed on expansion errors.
-
-### Command-Line Options
-- -f/--chat-file: Path to the chat file (default: ./gchat.md).
-- -t/--max-tokens: Default max_tokens level (e.g., L5 for 16384; max L5). Overridable per-prompt with @t.
-- -p/--temperature: Default temperature (e.g., 1.0). Overridable per-prompt with @p. Must be a float.
-- -T/--api-timeout: API request timeout in seconds (default: 600).
-- -a/--auto-request-files: Enable Grok to automatically request and include project files (default: false).
-- -i/--auto-increase-max-tokens: Automatically increase max_tokens level on truncation (up to L5) by re-querying (default: false).
-
-### Notes
-- Requires the 'rodio' crate for sounds (ensure audio dependencies are installed).
-- Logs to stderr (configure with RUST_LOG env var).
-- If response is truncated (due to max_tokens), a warning is printed.
-- Errors (e.g., API failures) play a warning sound and print details.
-
-### File Request Feature (Optional)
-Enable with --auto-request-files (-a). When enabled, Grok can request files from the project directory (current working directory) if needed. It responds with "GROK REQUESTS FILES: relative/path1, relative/path2" (exact format). The utility detects this, validates the paths (must be relative and within the project), appends a visible note with @f: placeholders to the last USER PROMPT (e.g., "\n\nGROK REQUESTED FILES:\n@f:src/main.rs\n@f:Cargo.toml\n"), and re-queries the API with the file contents included. This chains until a normal response is received.
-
-The note and placeholders are visible in the chat file (for user awareness) and expanded/included in the next API call (so Grok sees the contents). Requests are handled internally; invalid requests are treated as normal responses.
-
-Examples:
-- User prompt: "What's in my project's main file?"
-- Grok requests: GROK REQUESTS FILES: src/main.rs
-- App appends to USER PROMPT: \n\nGROK REQUESTED FILES:\n@f:src/main.rs\n
-- Supports directories/globs if requested (e.g., src/*).
-
-Security: Requests outside the project are ignored. Default: disabled.
-
-### Auto-Increase Max Tokens Feature (Optional)
-Enable with --auto-increase-max-tokens (-i). When enabled and a response is truncated (finish_reason: "max_tokens" or "length"), the utility automatically increments the max_tokens level (starting from the prompt's @t or default) and re-queries with the same messages and higher max_tokens (e.g., from L3 to L4). This chains until a non-truncated response is received or L5 (16384 tokens) is reached. If still truncated at L5, the response is appended with a warning.
-
-No changes are made to the chat file until a final (non-truncated or max-level) response is received. Retries are handled in-memory for efficiency. Visible console output shows retry attempts (e.g., "Response truncated. Retrying with L4 (8192 tokens)").
-
-This feature operates independently of --auto-request-files but can chain with it (e.g., a retry might trigger a file request).
-"#
-)]
-struct Args {
-    #[arg(short = 'f', long, default_value = "./gchat.md")]
-    chat_file: String,
-
-    #[arg(short = 't', long, default_value = "L3")]
-    max_tokens: String,
-
-    #[arg(short = 'p', long, default_value = "1.0")]
-    temperature: f32,
-
-    #[arg(short = 'm', long, default_value = "grok-4")]  // Default to "grok-4" or "grok-beta" based on testing
-    model: String,
-
-    #[arg(long, default_value = "600")]
-    api_timeout: u64,
-
-    #[arg(short = 'a', long = "auto-request-files", default_value = "false", help = "Enable Grok to automatically request and include project files (default: false)")]
-    auto_request_files: bool,
-
-    #[arg(short = 'i', long = "auto-increase-max-tokens", default_value = "false", help = "Automatically increase max_tokens on truncation (default: false)")]
-    auto_increase_max_tokens: bool,
+#[derive(Deserialize, Debug)]
+struct Config {
+    chat_file: Option<String>,
+    max_tokens: Option<String>,
+    temperature: Option<f32>,
+    model: Option<String>,
+    api_timeout: Option<u64>,
+    auto_request_files: Option<bool>,
+    auto_increase_max_tokens: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -132,7 +53,7 @@ struct Message {
     content: String,
 }
 
-#[derive(Serialize, Debug)]  // Added Debug derive for logging
+#[derive(Serialize, Debug)]
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
@@ -153,21 +74,165 @@ struct Choice {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    env_logger::init();  // Initialize logging (configure via RUST_LOG env var)
+    env_logger::init();
 
-    let args = Args::parse();
+    let mut config: Config = Config {
+        chat_file: None,
+        max_tokens: None,
+        temperature: None,
+        model: None,
+        api_timeout: None,
+        auto_request_files: None,
+        auto_increase_max_tokens: None,
+    };
+    if let Some(config_dir) = dirs::config_dir() {
+        let config_path = config_dir.join("gchat/config.toml");
+        if config_path.exists() {
+            let config_content = fs::read_to_string(&config_path)?;
+            config = toml::from_str(&config_content).map_err(|e| {
+                eprintln!("Error parsing config file {}: {}", config_path.display(), e);
+                io::Error::new(io::ErrorKind::InvalidData, e)
+            })?;
+            println!("Loaded config from {}", config_path.display());
+            println!("DEBUG: Loaded config values: {:?}", config);
+        } else {
+            println!("DEBUG: No config file found at {}", config_path.display());
+        }
+    }
 
-    // Parse the default level and max_tokens
-    let default_level = match get_level_from_str(&args.max_tokens) {
+    let app = Command::new("gchat")
+        .version(env!("CARGO_PKG_VERSION"))
+        .about("A utility to communicate with the Grok 4 API via a watched chat file.")
+        .long_about("A Rust utility that enables interactive conversations with the Grok API (from xAI) by monitoring a Markdown chat file. The app polls the file every 1 second for changes. When it detects a new user prompt (marked by \"USER PROMPT:\"), it sends the full conversation history to the Grok API, appends the response (marked by \"GROK RESPONSE:\"), and adds a new \"USER PROMPT:\" section for your next input. It plays a pleasant chime sound on successful responses and a warning sound on errors.")
+        .arg(
+            Arg::new("chat_file")
+                .short('f')
+                .long("chat-file")
+                .value_name("PATH")
+                .help("Path to the chat file"),
+        )
+        .arg(
+            Arg::new("max_tokens")
+                .short('t')
+                .long("max-tokens")
+                .value_name("LEVEL")
+                .help("Default max tokens level"),
+        )
+        .arg(
+            Arg::new("temperature")
+                .short('p')
+                .long("temperature")
+                .value_name("FLOAT")
+                .help("Default temperature"),
+        )
+        .arg(
+            Arg::new("model")
+                .short('m')
+                .long("model")
+                .value_name("STRING")
+                .help("The Grok model to call"),
+        )
+        .arg(
+            Arg::new("api_timeout")
+                .long("api-timeout")
+                .value_name("SECONDS")
+                .help("API request timeout"),
+        )
+        .arg(
+            Arg::new("auto_request_files")
+                .short('a')
+                .long("auto-request-files")
+                .help("Enable Grok to automatically request and include project files")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            Arg::new("auto_increase_max_tokens")
+                .short('i')
+                .long("auto-increase-max-tokens")
+                .help("Automatically increase max_tokens on truncation")
+                .action(clap::ArgAction::SetTrue),
+        );
+
+    let matches = app.get_matches();
+
+    // Debug prints for ALL relevant args/flags
+    println!("DEBUG: CLI contains chat_file: {}", matches.contains_id("chat_file"));
+    if matches.contains_id("chat_file") {
+        println!("DEBUG: CLI chat_file value: {}", matches.get_one::<String>("chat_file").unwrap());
+    }
+    println!("DEBUG: CLI contains max_tokens: {}", matches.contains_id("max_tokens"));
+    if matches.contains_id("max_tokens") {
+        println!("DEBUG: CLI max_tokens value: {}", matches.get_one::<String>("max_tokens").unwrap());
+    }
+    println!("DEBUG: CLI contains temperature: {}", matches.contains_id("temperature"));
+    if matches.contains_id("temperature") {
+        println!("DEBUG: CLI temperature value: {}", matches.get_one::<String>("temperature").unwrap());
+    }
+    println!("DEBUG: CLI contains model: {}", matches.contains_id("model"));
+    if matches.contains_id("model") {
+        println!("DEBUG: CLI model value: {}", matches.get_one::<String>("model").unwrap());
+    }
+    println!("DEBUG: CLI contains api_timeout: {}", matches.contains_id("api_timeout"));
+    if matches.contains_id("api_timeout") {
+        println!("DEBUG: CLI api_timeout value: {}", matches.get_one::<String>("api_timeout").unwrap());
+    }
+    println!("DEBUG: CLI contains auto_request_files: {}", matches.contains_id("auto_request_files"));
+    println!("DEBUG: CLI contains auto_increase_max_tokens: {}", matches.contains_id("auto_increase_max_tokens"));
+
+    // Extract final values: CLI overrides config overrides defaults
+    let chat_file = if matches.contains_id("chat_file") {
+        matches.get_one::<String>("chat_file").unwrap().clone()
+    } else {
+        config.chat_file.unwrap_or(DEFAULT_CHAT_FILE.to_string())
+    };
+
+    let max_tokens_str = if matches.contains_id("max_tokens") {
+        matches.get_one::<String>("max_tokens").unwrap().clone()
+    } else {
+        config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS.to_string())
+    };
+
+    let temperature = if matches.contains_id("temperature") {
+        matches.get_one::<String>("temperature").unwrap().parse::<f32>().unwrap()
+    } else {
+        config.temperature.unwrap_or(DEFAULT_TEMPERATURE.parse::<f32>().unwrap())
+    };
+
+    let model = if matches.contains_id("model") {
+        matches.get_one::<String>("model").unwrap().clone()
+    } else {
+        config.model.unwrap_or(DEFAULT_MODEL.to_string())
+    };
+
+    let api_timeout = if matches.contains_id("api_timeout") {
+        matches.get_one::<String>("api_timeout").unwrap().parse::<u64>().unwrap()
+    } else {
+        config.api_timeout.unwrap_or(DEFAULT_API_TIMEOUT.parse::<u64>().unwrap())
+    };
+
+    let auto_request_files = if matches.contains_id("auto_request_files") {
+        true
+    } else {
+        config.auto_request_files.unwrap_or(DEFAULT_AUTO_REQUEST_FILES)
+    };
+
+    let auto_increase_max_tokens = if matches.contains_id("auto_increase_max_tokens") {
+        true
+    } else {
+        config.auto_increase_max_tokens.unwrap_or(DEFAULT_AUTO_INCREASE_MAX_TOKENS)
+    };
+
+    // Parse the default level and max_tokens (using the final max_tokens_str)
+    let default_level = match get_level_from_str(&max_tokens_str) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Error parsing --max-tokens: {}", e);
+            eprintln!("Error parsing max_tokens: {}", e);
             std::process::exit(1);
         }
     };
     let default_max_tokens = 512u32 << default_level;
 
-    let chat_path = PathBuf::from(&args.chat_file);
+    let chat_path = PathBuf::from(&chat_file);
 
     // Create chat file if it doesn't exist
     if !chat_path.exists() {
@@ -181,25 +246,25 @@ async fn main() -> io::Result<()> {
 
     // Print settings on startup
     println!("Running with settings:");
-    println!("  Chat file: {}", args.chat_file);
-    println!("  Max tokens: {} ({})", args.max_tokens, default_max_tokens);
-    println!("  Temperature: {}", args.temperature);
-    println!("  API model: {}", args.model);
-    println!("  API timeout: {} seconds", args.api_timeout);
-    println!("  Auto request files: {}", args.auto_request_files);
-    println!("  Auto increase max tokens: {}", args.auto_increase_max_tokens);
+    println!("  Chat file: {}", chat_file);
+    println!("  Max tokens: {} ({})", max_tokens_str, default_max_tokens);
+    println!("  Temperature: {}", temperature);
+    println!("  API model: {}", model);
+    println!("  API timeout: {} seconds", api_timeout);
+    println!("  Auto request files: {}", auto_request_files);
+    println!("  Auto increase max tokens: {}", auto_increase_max_tokens);
 
-    println!("App started. Polling {} for changes every 1 second.", args.chat_file);
+    println!("App started. Polling {} for changes every 1 second.", chat_file);
 
     // Initial process on startup
     if let Err(e) = process_chat_file(
         &chat_path,
         default_level,
-        args.temperature,
-        args.api_timeout,
-        args.auto_request_files,
-        args.auto_increase_max_tokens,
-        &args.model,
+        temperature,
+        api_timeout,
+        auto_request_files,
+        auto_increase_max_tokens,
+        &model,
     )
     .await
     {
@@ -230,11 +295,11 @@ async fn main() -> io::Result<()> {
             if let Err(e) = process_chat_file(
                 &chat_path,
                 default_level,
-                args.temperature,
-                args.api_timeout,
-                args.auto_request_files,
-                args.auto_increase_max_tokens,
-                &args.model,
+                temperature,
+                api_timeout,
+                auto_request_files,
+                auto_increase_max_tokens,
+                &model,
             )
             .await
             {
