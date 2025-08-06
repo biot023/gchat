@@ -21,6 +21,13 @@ const USER_PROMPT_MARKER: &str = "USER PROMPT";
 const THINKING_MESSAGE: &str = "Grok is thinking...";
 const MAX_LEVEL: u32 = 5; // Corresponds to L5 = 16384, as per original default
 
+// Add this constant for the system instructions
+const SYSTEM_INSTRUCTIONS: &str = r#"
+You are Grok, a helpful AI. If you need the contents of files to better answer the user's query, you can request them by responding with EXACTLY this format and NOTHING ELSE:
+GROK REQUESTS FILES: relative/path1, relative/path2
+Paths must be relative to the current working directory (e.g., src/main.rs, not /absolute/path or ../outside). Do not request files outside the project directory. You can request multiple files, directories, or globs (e.g., src/*.rs). The system will automatically include their contents in the next user message. Request all needed files at once if possible. You may request again if more are needed after seeing the contents.
+"#;
+
 #[derive(Parser, Debug)]
 #[command(
     version,
@@ -71,20 +78,36 @@ Placeholders are removed/expanded before API calls. Warnings are printed on expa
 - Logs to stderr (configure with RUST_LOG env var).
 - If response is truncated (due to max_tokens), a warning is printed.
 - Errors (e.g., API failures) play a warning sound and print details.
+
+### File Request Feature (Optional)
+Enable with --auto-request-files (-a). When enabled, Grok can request files from the project directory (current working directory) if needed. It responds with "GROK REQUESTS FILES: relative/path1, relative/path2" (exact format). The utility detects this, validates the paths (must be relative and within the project), appends a visible note with @f: placeholders to the last USER PROMPT (e.g., "\n\nGROK REQUESTED FILES:\n@f:src/main.rs\n@f:Cargo.toml\n"), and re-queries the API with the file contents included. This chains until a normal response is received.
+
+The note and placeholders are visible in the chat file (for user awareness) and expanded/included in the next API call (so Grok sees the contents). Requests are handled internally; invalid requests are treated as normal responses.
+
+Examples:
+- User prompt: "What's in my project's main file?"
+- Grok requests: GROK REQUESTS FILES: src/main.rs
+- App appends to USER PROMPT: \n\nGROK REQUESTED FILES:\n@f:src/main.rs\n
+- Supports directories/globs if requested (e.g., src/*).
+
+Security: Requests outside the project are ignored. Default: disabled.
 "#
 )]
 struct Args {
     #[arg(short = 'f', long, default_value = "./gchat.md")]
     chat_file: String,
 
-    #[arg(short = 't', long, default_value = "L5")]
+    #[arg(short = 't', long, default_value = "L3")]
     max_tokens: String,
 
     #[arg(short = 'T', long, default_value = "600")]
     api_timeout: u64,
+
+    #[arg(short = 'a', long = "auto-request-files", default_value = "false", help = "Enable Grok to automatically request and include project files (default: false)")]
+    auto_request_files: bool,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 struct Message {
     role: String,
     content: String,
@@ -119,7 +142,7 @@ async fn main() -> io::Result<()> {
     let max_tokens = match parse_level(&args.max_tokens) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Error parsing --max-tokens: {}", e);
+            eprintln!("Error parsing --max_tokens: {}", e);
             std::process::exit(1);
         }
     };
@@ -141,6 +164,7 @@ async fn main() -> io::Result<()> {
     println!("  Chat file: {}", args.chat_file);
     println!("  Max tokens: {} ({})", args.max_tokens, max_tokens);
     println!("  API timeout: {} seconds", args.api_timeout);
+    println!("  Auto request files: {}", args.auto_request_files);  // New: Print the flag status
 
     println!("App started. Polling {} for changes every 1 second.", args.chat_file);
 
@@ -149,6 +173,7 @@ async fn main() -> io::Result<()> {
         &chat_path,
         max_tokens,
         args.api_timeout,
+        args.auto_request_files,  // Pass the flag
     )
     .await
     {
@@ -180,6 +205,7 @@ async fn main() -> io::Result<()> {
                 &chat_path,
                 max_tokens,
                 args.api_timeout,
+                args.auto_request_files,  // Pass the flag
             )
             .await
             {
@@ -213,142 +239,214 @@ async fn process_chat_file(
     chat_path: &PathBuf,
     max_tokens: u32,
     api_timeout: u64,
+    auto_request_files: bool,  // New parameter
 ) -> io::Result<()> {
     // Short debounce to ensure save is complete (helps with atomic saves)
     sleep(Duration::from_millis(500)).await;
 
-    let content = fs::read_to_string(chat_path)?;
-    let mut messages = parse_chat_messages(&content);
+    // Now process in a loop to handle chained file requests (only if flag is enabled)
+    loop {
+        let content = fs::read_to_string(chat_path)?;
+        let mut messages = parse_chat_messages(&content);
 
-    if messages.is_empty() || messages.last().unwrap().role != "user" || messages.last().unwrap().content.trim().is_empty() {
-        println!("No complete user prompt to process in chat file.");
-        return Ok(()); // No send needed
-    }
+        if messages.is_empty() || messages.last().unwrap().role != "user" || messages.last().unwrap().content.trim().is_empty() {
+            println!("No complete user prompt to process in chat file.");
+            return Ok(()); // No send needed
+        }
 
-    // Handle @t placeholders: remove from all user messages, and set local_max_tokens from the last @t in the last user message
-    let mut local_max_tokens = max_tokens;
-    let re = Regex::new(r"@t\s*:\s*L(\d+)").unwrap();
-    for i in 0..messages.len() {
-        if messages[i].role == "user" {
-            let content = &messages[i].content;
-            let mut new_content = content.to_string();
-            let mut last_level: Option<u32> = None;
-            let mut ranges = vec![];
-            for cap in re.captures_iter(content) {
-                let whole = cap.get(0).unwrap();
-                ranges.push(whole.range());
-                if let Some(num_str) = cap.get(1) {
-                    if let Ok(lvl) = num_str.as_str().parse::<u32>() {
-                        last_level = Some(lvl);
+        // Handle @t placeholders: remove from all user messages, and track the last @t across all user messages
+        let mut local_max_tokens = max_tokens;
+        let re = Regex::new(r"@t\s*:\s*L(\d+)").unwrap();
+        let mut persistent_level: Option<u32> = None;
+        for i in 0..messages.len() {
+            if messages[i].role == "user" {
+                let content = &messages[i].content;
+                let mut new_content = content.to_string();
+                let mut last_level: Option<u32> = None;
+                let mut ranges = vec![];
+                for cap in re.captures_iter(content) {
+                    let whole = cap.get(0).unwrap();
+                    ranges.push(whole.range());
+                    if let Some(num_str) = cap.get(1) {
+                        if let Ok(lvl) = num_str.as_str().parse::<u32>() {
+                            last_level = Some(lvl);
+                        }
                     }
                 }
-            }
-            // Remove in reverse order to avoid index issues
-            for range in ranges.into_iter().rev() {
-                new_content.replace_range(range, "");
-            }
-            messages[i].content = new_content;
-            // If this is the last message, apply the last_level if present
-            if i == messages.len() - 1 {
+                // Remove in reverse order to avoid index issues
+                for range in ranges.into_iter().rev() {
+                    new_content.replace_range(range, "");
+                }
+                messages[i].content = new_content;
+                // Update persistent_level if this message had a @t
                 if let Some(lvl) = last_level {
-                    let mut effective_lvl = lvl;
-                    if effective_lvl > MAX_LEVEL {
-                        println!(
-                            "Warning: Specified level L{} too high, capping at L{} ({} tokens)",
-                            lvl,
-                            MAX_LEVEL,
-                            512u32 << MAX_LEVEL
-                        );
-                        effective_lvl = MAX_LEVEL;
+                    persistent_level = Some(lvl);
+                }
+            }
+        }
+        // After processing all messages, apply the last seen level if any
+        if let Some(lvl) = persistent_level {
+            let mut effective_lvl = lvl;
+            if effective_lvl > MAX_LEVEL {
+                println!(
+                    "Warning: Specified level L{} too high, capping at L{} ({} tokens)",
+                    lvl,
+                    MAX_LEVEL,
+                    512u32 << MAX_LEVEL
+                );
+                effective_lvl = MAX_LEVEL;
+            }
+            local_max_tokens = 512u32 << effective_lvl;
+            println!("Setting `max_tokens` API parameter to {}", local_max_tokens);
+        }
+
+        // Expand other placeholders ONLY in user messages (prompts to the API)
+        for msg in messages.iter_mut() {
+            if msg.role == "user" {
+                msg.content = expand_placeholders(&msg.content)?;
+            }
+        }
+
+        // Log the expanded messages (DEBUG level)
+        log::debug!("Expanded messages for API request: {:?}", messages);
+
+        // Prepend system instructions ONLY if flag is enabled
+        let mut api_messages = messages.clone();  // Clone to avoid mutating original
+        if auto_request_files {
+            api_messages.insert(0, Message {
+                role: "system".to_string(),
+                content: SYSTEM_INSTRUCTIONS.to_string(),
+            });
+        }
+
+        // Get API key, build client, create req
+        let api_key = env::var("XAI_API_KEY").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "XAI_API_KEY not set"))?;
+        let client = Client::builder()
+            .timeout(Duration::from_secs(api_timeout))
+            .build()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let req = ChatRequest {
+            model: "grok-4-0709".to_string(),
+            messages: api_messages,  // Use api_messages (with or without system prompt)
+            temperature: 1.0,
+            max_tokens: local_max_tokens,
+        };
+
+        // Log the full request (DEBUG level)
+        log::debug!("Sending API request: {:?}", req);
+
+        // Build the request but don't send yet
+        let request_builder = client
+            .post("https://api.x.ai/v1/chat/completions")
+            .header("Content-Type", "application/json")
+            .header("Authorization", format!("Bearer {}", api_key))
+            .json(&req);
+
+        // Print thinking message
+        println!("{}", THINKING_MESSAGE);
+
+        // Now send and await
+        let res = request_builder.send().await;
+
+        match res {
+            Ok(resp) if resp.status().is_success() => {
+                let chat_resp: ChatResponse = resp.json().await.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                let assistant_content = chat_resp.choices[0].message.content.clone();
+
+                // Check if this is a file request (only if flag is enabled)
+                let mut is_file_request = false;
+                if auto_request_files {
+                    let trimmed = assistant_content.trim();
+                    if trimmed.starts_with("GROK REQUESTS FILES:") {
+                        let rest = trimmed.strip_prefix("GROK REQUESTS FILES:").unwrap().trim();
+                        // Ensure it's exactly the format (no extra content)
+                        if !rest.is_empty() && trimmed == format!("GROK REQUESTS FILES: {}", rest) {
+                            let paths: Vec<String> = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+
+                            // Validate paths
+                            let cwd = env::current_dir().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                            let mut all_valid = true;
+                            let mut valid_paths = vec![];
+                            for p in paths.iter() {
+                                let path = PathBuf::from(p);
+                                // Block absolute paths or parent traversal
+                                if path.is_absolute() || p.starts_with("..") || p.contains("..") {
+                                    println!("Warning: Invalid path requested (traversal attempt): {}", p);
+                                    all_valid = false;
+                                    break;
+                                }
+                                // Canonicalize and check if within cwd
+                                let full_path = cwd.join(&path);
+                                match full_path.canonicalize() {
+                                    Ok(canon) if canon.starts_with(&cwd) => {
+                                        valid_paths.push(p.clone());
+                                    }
+                                    _ => {
+                                        println!("Warning: Path outside project or invalid: {}", p);
+                                        all_valid = false;
+                                        break;
+                                    }
+                                }
+                            }
+
+                            if all_valid && !valid_paths.is_empty() {
+                                // Append visible note and placeholders to the END of the file (augments the last USER PROMPT)
+                                let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
+                                writeln!(file, "\n\nGROK REQUESTED FILES:")?;
+                                for vp in valid_paths {
+                                    writeln!(file, "@f:{}", vp)?;  // No space after 'f'
+                                }
+
+                                // Continue the loop to immediately re-process (no sleep needed, as we just wrote)
+                                is_file_request = true;
+                            }
+                        }
                     }
-                    local_max_tokens = 512u32 << effective_lvl;
-                    println!("Setting `max_tokens` API parameter to {}", local_max_tokens);
                 }
-            }
-        }
-    }
 
-    // Expand other placeholders ONLY in user messages (prompts to the API)
-    for msg in messages.iter_mut() {
-        if msg.role == "user" {
-            msg.content = expand_placeholders(&msg.content)?;
-        }
-    }
-
-    // Log the expanded messages (DEBUG level)
-    log::debug!("Expanded messages for API request: {:?}", messages);
-
-    // Get API key, build client, create req
-    let api_key = env::var("XAI_API_KEY").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "XAI_API_KEY not set"))?;
-    let client = Client::builder()
-        .timeout(Duration::from_secs(api_timeout))
-        .build()
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    let req = ChatRequest {
-        model: "grok-4-0709".to_string(),
-        messages,
-        temperature: 1.0,
-        max_tokens: local_max_tokens,
-    };
-
-    // Log the full request (DEBUG level)
-    log::debug!("Sending API request: {:?}", req);
-
-    // Build the request but don't send yet
-    let request_builder = client
-        .post("https://api.x.ai/v1/chat/completions")
-        .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&req);
-
-    // Print thinking message
-    println!("{}", THINKING_MESSAGE);
-
-    // Now send and await
-    let res = request_builder.send().await;
-
-    match res {
-        Ok(resp) if resp.status().is_success() => {
-            let chat_resp: ChatResponse = resp.json().await.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-            let assistant_content = chat_resp.choices[0].message.content.clone();
-            if let Some(reason) = &chat_resp.choices[0].finish_reason {
-                if reason == "length" {
-                    println!("Grok has thought.");
-                    println!("Warning: Response truncated due to max_tokens limit!");
-                    // Optionally append a note to the chat file: "... [truncated]"
+                // If it was a valid file request, loop back without appending a response
+                if is_file_request {
+                    continue;
                 }
+
+                // Otherwise, treat as normal response
+                if let Some(reason) = &chat_resp.choices[0].finish_reason {
+                    if reason == "length" {
+                        println!("Warning: Response truncated due to max_tokens limit!");
+                    }
+                }
+                println!("Grok has thought.");
+                let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
+                writeln!(
+                    file,
+                    "\n{}:\n{}\n\n{}:\n",
+                    GROK_RESPONSE_MARKER,
+                    assistant_content,
+                    USER_PROMPT_MARKER
+                )?;
+
+                // Play chime sound
+                play_chime().await;
+
+                // Break the loop after handling a normal response
+                break;
             }
-            println!("Received from API: {}", assistant_content);
-
-            // Append to file
-            println!("Grok has thought.");
-            let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
-            writeln!(
-                file,
-                "\n{}:\n{}\n\n{}:\n",
-                GROK_RESPONSE_MARKER,
-                assistant_content,
-                USER_PROMPT_MARKER
-            )?;
-
-            // Play chime sound
-            play_chime().await;
-
-            Ok(())
+            Ok(resp) => {
+                let status = resp.status();
+                let err_body = resp.text().await.unwrap_or_default();
+                println!("Grok failed to respond.");
+                play_warning().await;
+                return Err(io::Error::new(io::ErrorKind::Other, format!("API error: {} - Body: {}", status, err_body)));
+            }
+            Err(e) => {
+                println!("Grok failed to respond.");
+                play_warning().await;
+                return Err(io::Error::new(io::ErrorKind::Other, format!("Request error: {:?}", e)));
+            },
         }
-        Ok(resp) => {
-            let status = resp.status();
-            let err_body = resp.text().await.unwrap_or_default();
-            println!("Grok failed to respond.");
-            play_warning().await;
-            Err(io::Error::new(io::ErrorKind::Other, format!("API error: {} - Body: {}", status, err_body)))
-        }
-        Err(e) => {
-            println!("Grok failed to respond.");
-            play_warning().await;
-            Err(io::Error::new(io::ErrorKind::Other, format!("Request error: {:?}", e)))
-        },
     }
+
+    Ok(())
 }
 
 fn parse_chat_messages(content: &str) -> Vec<Message> {

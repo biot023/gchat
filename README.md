@@ -11,7 +11,7 @@ You are a Rust expert.
 You are assisting me in developing a Grok 4 chat utility.
 All the code for the project is here: @f:./src
 There is a media file: @d:./media
-The crates are detailed here: @f:.Cargo.toml
+The crates are detailed here: @f:./Cargo.toml
 
 For starters, please could you make the help message a bit more friendly?
 ```
@@ -32,11 +32,12 @@ This tool is ideal for users who prefer editing a file in their favorite text ed
 - **Placeholders in Prompts**:
   - `@f :path`: Includes the contents of a file, glob pattern (e.g., `./*.rs`), or entire directory (recursively).
   - `@d :path`: Includes a tree listing of a directory's contents (files and subdirs).
-  - `@t :L<level>`: Sets the `max_tokens` for that specific prompt (e.g., `@t :L3` for 4096 tokens). Overrides the default; the last one in the prompt wins.
+  - `@t :L<level>`: Sets the `max_tokens` for that specific prompt (e.g., `@t :L3` for 4096 tokens). Overrides the default; the last one in the prompt wins. Multiple in history: The last one across all user messages wins.
 - **Audio Feedback**: Chime on success, warning tones on failure (requires audio dependencies for `rodio`).
 - **Logging**: Configure via `RUST_LOG` environment variable (e.g., `RUST_LOG=debug` for detailed output, including API requests/responses).
 - **Truncation Handling**: Warns if the API response is truncated due to token limits.
 - **Initial Processing**: On startup, processes any pending user prompt in the file.
+- **Auto File Requests**: Optional feature (enabled with `--auto-request-files` or `-a`). Allows Grok to request files from your project directory if needed to answer queries. Grok responds in a specific format ("GROK REQUESTS FILES: relative/path1, relative/path2"), and the utility automatically appends placeholders (e.g., `@f:src/main.rs`) to the last user prompt, then re-queries the API with the contents included. This chains until a normal response is received. Paths are validated to stay within the project directory (no absolute paths or parent traversal). Supports globs and directories if requested.
 
 ## Installation
 
@@ -56,7 +57,7 @@ This tool is ideal for users who prefer editing a file in their favorite text ed
    ```
    cargo build --release
    ```
-   The executable will be in `target/release/<binary-name>` (binary name is based on your `Cargo.toml`, e.g., `grok-chat-watcher`).
+   The executable will be in `target/release/gchat` (binary name based on `Cargo.toml`).
 
    To run directly:
    ```
@@ -104,10 +105,11 @@ Use `cargo run -- --help` for full details. Key options:
 - `-f, --chat-file <PATH>`: Path to the chat file (default: `./gchat.md`).
 - `-t, --max-tokens <LEVEL>`: Default max tokens level (e.g., `L5` for 16384 tokens). Can be overridden per-prompt with `@t`. See "Token Levels" below for details.
 - `-T, --api-timeout <SECONDS>`: API request timeout (default: 600 seconds).
+- `-a, --auto-request-files`: Enable Grok to automatically request and include project files if needed (default: false). See "Auto File Requests" below for details.
 
 Example:
 ```
-cargo run -- -f mychat.md -t L3 -T 300
+cargo run -- -f mychat.md -t L3 -T 300 -a
 ```
 
 ### Basic Workflow
@@ -172,6 +174,26 @@ Format: `L<digit>`, e.g., `L5`. Invalid formats (e.g., `L6` or `512`) will error
 - If the response is truncated (hits the limit), a warning is printed: "Warning: Response truncated due to max_tokens limit!"
 
 Higher levels allow longer responses but may increase API costs/latency.
+
+### Auto File Requests
+Enabled with `--auto-request-files` (or `-a`). This allows Grok to request files from your project directory (current working directory) if it needs them to answer a query better.
+
+- Grok must respond with **exactly** "GROK REQUESTS FILES: relative/path1, relative/path2" (and nothing else).
+- Paths must be relative (e.g., `src/main.rs`, not `/absolute/path` or `../outside`). Supports multiple paths, directories, or globs (e.g., `src/*.rs`).
+- The utility validates paths (must stay within the project; blocks traversal).
+- If valid, it appends a visible note to the last "USER PROMPT:" in the chat file, like:
+  ```
+  \n\nGROK REQUESTED FILES:\n@f:src/main.rs\n@f:Cargo.toml\n
+  ```
+- It then immediately re-processes the file, expanding the placeholders so Grok sees the contents in the next API call.
+- This chains automatically until Grok provides a normal response.
+- Invalid requests are treated as normal responses (not re-queried).
+- Security: Requests outside the project are ignored. Disabled by default.
+
+Example:
+- User prompt: "What's in my project's main file?"
+- Grok requests: GROK REQUESTS FILES: src/main.rs
+- App appends to prompt and re-queries with file contents included.
 
 ## Notes
 - **Polling**: Checks every 1 second; includes a 500ms debounce after detection to handle file saves.
