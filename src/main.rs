@@ -271,15 +271,14 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
 
     for line in content.lines() {
         if line == "USER PROMPT:" || line == "GROK RESPONSE:" {
-            // Add previous section if it exists and is non-empty
-            if let Some(role) = current_role.take() {
-                let trimmed = current_content.trim().to_string();
-                if !trimmed.is_empty() {
-                    messages.push(Message {
-                        role,
-                        content: trimmed,
-                    });
-                }
+            // Add previous section if content is non-empty
+            let trimmed = current_content.trim().to_string();
+            if !trimmed.is_empty() {
+                let role = current_role.take().unwrap_or("user".to_string());
+                messages.push(Message {
+                    role,
+                    content: trimmed,
+                });
             }
 
             // Start new section
@@ -291,15 +290,14 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
         }
     }
 
-    // Add the last section if it exists and is non-empty
-    if let Some(role) = current_role {
-        let trimmed = current_content.trim().to_string();
-        if !trimmed.is_empty() {
-            messages.push(Message {
-                role,
-                content: trimmed,
-            });
-        }
+    // Add the last section if content is non-empty
+    let trimmed = current_content.trim().to_string();
+    if !trimmed.is_empty() {
+        let role = current_role.unwrap_or("user".to_string());
+        messages.push(Message {
+            role,
+            content: trimmed,
+        });
     }
 
     messages
