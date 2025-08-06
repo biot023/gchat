@@ -18,7 +18,6 @@ use log;  // New import for logging
 
 const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
-const THINKING_MESSAGE: &str = "Grok is thinking...";
 const MAX_LEVEL: u32 = 5; // Corresponds to L5 = 16384, as per original default
 
 // Add this constant for the system instructions
@@ -65,13 +64,17 @@ These are expanded ONLY in "USER PROMPT:" sections before sending to the API:
 - @f :path - Include file contents (e.g., @f :./file.txt). Supports globs (e.g., @f :./*.rs) or directories (recursively includes all files).
 - @d :path - Include directory tree listing (e.g., @d :./src). Shows files and subdirs recursively.
 - @t :L<level> - Set max_tokens for this prompt (e.g., @t :L3 for 4096 tokens). Removed after processing; last @t in the prompt wins. Levels: L0 (512) to L5 (16384).
+- @p :<value> - Set temperature for this prompt (e.g., @p :0.9 for temperature=0.9). Removed after processing; last @p in the prompt wins. Value is a float (e.g., 0.0 to 2.0).
 
 Placeholders are removed/expanded before API calls. Warnings are printed on expansion errors.
 
 ### Command-Line Options
 - -f/--chat-file: Path to the chat file (default: ./gchat.md).
 - -t/--max-tokens: Default max_tokens level (e.g., L5 for 16384; max L5). Overridable per-prompt with @t.
+- -p/--temperature: Default temperature (e.g., 1.0). Overridable per-prompt with @p. Must be a float.
 - -T/--api-timeout: API request timeout in seconds (default: 600).
+- -a/--auto-request-files: Enable Grok to automatically request and include project files (default: false).
+- -i/--auto-increase-max-tokens: Automatically increase max_tokens level on truncation (up to L5) by re-querying (default: false).
 
 ### Notes
 - Requires the 'rodio' crate for sounds (ensure audio dependencies are installed).
@@ -91,6 +94,13 @@ Examples:
 - Supports directories/globs if requested (e.g., src/*).
 
 Security: Requests outside the project are ignored. Default: disabled.
+
+### Auto-Increase Max Tokens Feature (Optional)
+Enable with --auto-increase-max-tokens (-i). When enabled and a response is truncated (finish_reason: "max_tokens" or "length"), the utility automatically increments the max_tokens level (starting from the prompt's @t or default) and re-queries with the same messages and higher max_tokens (e.g., from L3 to L4). This chains until a non-truncated response is received or L5 (16384 tokens) is reached. If still truncated at L5, the response is appended with a warning.
+
+No changes are made to the chat file until a final (non-truncated or max-level) response is received. Retries are handled in-memory for efficiency. Visible console output shows retry attempts (e.g., "Response truncated. Retrying with L4 (8192 tokens)").
+
+This feature operates independently of --auto-request-files but can chain with it (e.g., a retry might trigger a file request).
 "#
 )]
 struct Args {
@@ -100,11 +110,20 @@ struct Args {
     #[arg(short = 't', long, default_value = "L3")]
     max_tokens: String,
 
-    #[arg(short = 'T', long, default_value = "600")]
+    #[arg(short = 'p', long, default_value = "1.0")]
+    temperature: f32,
+
+    #[arg(short = 'm', long, default_value = "grok-4")]  // Default to "grok-4" or "grok-beta" based on testing
+    model: String,
+
+    #[arg(long, default_value = "600")]
     api_timeout: u64,
 
     #[arg(short = 'a', long = "auto-request-files", default_value = "false", help = "Enable Grok to automatically request and include project files (default: false)")]
     auto_request_files: bool,
+
+    #[arg(short = 'i', long = "auto-increase-max-tokens", default_value = "false", help = "Automatically increase max_tokens on truncation (default: false)")]
+    auto_increase_max_tokens: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -138,14 +157,15 @@ async fn main() -> io::Result<()> {
 
     let args = Args::parse();
 
-    // Parse the max_tokens level
-    let max_tokens = match parse_level(&args.max_tokens) {
+    // Parse the default level and max_tokens
+    let default_level = match get_level_from_str(&args.max_tokens) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("Error parsing --max_tokens: {}", e);
+            eprintln!("Error parsing --max-tokens: {}", e);
             std::process::exit(1);
         }
     };
+    let default_max_tokens = 512u32 << default_level;
 
     let chat_path = PathBuf::from(&args.chat_file);
 
@@ -162,18 +182,24 @@ async fn main() -> io::Result<()> {
     // Print settings on startup
     println!("Running with settings:");
     println!("  Chat file: {}", args.chat_file);
-    println!("  Max tokens: {} ({})", args.max_tokens, max_tokens);
+    println!("  Max tokens: {} ({})", args.max_tokens, default_max_tokens);
+    println!("  Temperature: {}", args.temperature);
+    println!("  API model: {}", args.model);
     println!("  API timeout: {} seconds", args.api_timeout);
-    println!("  Auto request files: {}", args.auto_request_files);  // New: Print the flag status
+    println!("  Auto request files: {}", args.auto_request_files);
+    println!("  Auto increase max tokens: {}", args.auto_increase_max_tokens);
 
     println!("App started. Polling {} for changes every 1 second.", args.chat_file);
 
     // Initial process on startup
     if let Err(e) = process_chat_file(
         &chat_path,
-        max_tokens,
+        default_level,
+        args.temperature,
         args.api_timeout,
-        args.auto_request_files,  // Pass the flag
+        args.auto_request_files,
+        args.auto_increase_max_tokens,
+        &args.model,
     )
     .await
     {
@@ -203,9 +229,12 @@ async fn main() -> io::Result<()> {
             // File changed: process it
             if let Err(e) = process_chat_file(
                 &chat_path,
-                max_tokens,
+                default_level,
+                args.temperature,
                 args.api_timeout,
-                args.auto_request_files,  // Pass the flag
+                args.auto_request_files,
+                args.auto_increase_max_tokens,
+                &args.model,
             )
             .await
             {
@@ -217,11 +246,11 @@ async fn main() -> io::Result<()> {
     }
 }
 
-fn parse_level(s: &str) -> Result<u32, String> {
+fn get_level_from_str(s: &str) -> Result<u32, String> {
     let s = s.trim();
     if let Some(lstr) = s.strip_prefix('L') {
         match lstr.parse::<u32>() {
-            Ok(level) if level <= MAX_LEVEL => Ok(512u32 << level),
+            Ok(level) if level <= MAX_LEVEL => Ok(level),
             Ok(level) => Err(format!(
                 "Level too high: L{}, max L{} ({} tokens)",
                 level,
@@ -235,16 +264,23 @@ fn parse_level(s: &str) -> Result<u32, String> {
     }
 }
 
+fn parse_level(level: u32) -> u32 {
+    512u32 << level
+}
+
 async fn process_chat_file(
     chat_path: &PathBuf,
-    max_tokens: u32,
+    default_level: u32,
+    default_temperature: f32,
     api_timeout: u64,
-    auto_request_files: bool,  // New parameter
+    auto_request_files: bool,
+    auto_increase_max_tokens: bool,
+    model: &str,
 ) -> io::Result<()> {
     // Short debounce to ensure save is complete (helps with atomic saves)
     sleep(Duration::from_millis(500)).await;
 
-    // Now process in a loop to handle chained file requests (only if flag is enabled)
+    // Outer loop to handle chained file requests (which modify the file)
     loop {
         let content = fs::read_to_string(chat_path)?;
         let mut messages = parse_chat_messages(&content);
@@ -255,8 +291,7 @@ async fn process_chat_file(
         }
 
         // Handle @t placeholders: remove from all user messages, and track the last @t across all user messages
-        let mut local_max_tokens = max_tokens;
-        let re = Regex::new(r"@t\s*:\s*L(\d+)").unwrap();
+        let re_t = Regex::new(r"@t\s*:\s*L(\d+)").unwrap();
         let mut persistent_level: Option<u32> = None;
         for i in 0..messages.len() {
             if messages[i].role == "user" {
@@ -264,7 +299,7 @@ async fn process_chat_file(
                 let mut new_content = content.to_string();
                 let mut last_level: Option<u32> = None;
                 let mut ranges = vec![];
-                for cap in re.captures_iter(content) {
+                for cap in re_t.captures_iter(content) {
                     let whole = cap.get(0).unwrap();
                     ranges.push(whole.range());
                     if let Some(num_str) = cap.get(1) {
@@ -284,20 +319,64 @@ async fn process_chat_file(
                 }
             }
         }
-        // After processing all messages, apply the last seen level if any
+
+        // Set current_level based on persistent or default, with capping if needed
+        let mut current_level = default_level;
         if let Some(lvl) = persistent_level {
-            let mut effective_lvl = lvl;
-            if effective_lvl > MAX_LEVEL {
+            current_level = lvl;
+            if current_level > MAX_LEVEL {
                 println!(
                     "Warning: Specified level L{} too high, capping at L{} ({} tokens)",
                     lvl,
                     MAX_LEVEL,
                     512u32 << MAX_LEVEL
                 );
-                effective_lvl = MAX_LEVEL;
+                current_level = MAX_LEVEL;
             }
-            local_max_tokens = 512u32 << effective_lvl;
-            println!("Setting `max_tokens` API parameter to {}", local_max_tokens);
+            println!("Setting `max_tokens` API parameter to {}", parse_level(current_level));
+        }
+
+        // Handle @p placeholders: similar to @t, remove from all user messages, track the last @p across all user messages
+        let mut local_temperature = default_temperature;
+        let re_p = Regex::new(r"@p\s*:\s*(\d*\.?\d+)").unwrap();
+        let mut persistent_temperature: Option<f32> = None;
+        for i in 0..messages.len() {
+            if messages[i].role == "user" {
+                let content = &messages[i].content;
+                let mut new_content = content.to_string();
+                let mut last_temp: Option<f32> = None;
+                let mut ranges = vec![];
+                for cap in re_p.captures_iter(content) {
+                    let whole = cap.get(0).unwrap();
+                    ranges.push(whole.range());
+                    if let Some(num_str) = cap.get(1) {
+                        if let Ok(temp) = num_str.as_str().parse::<f32>() {
+                            last_temp = Some(temp);
+                        }
+                    }
+                }
+                // Remove in reverse order to avoid index issues
+                for range in ranges.into_iter().rev() {
+                    new_content.replace_range(range, "");
+                }
+                messages[i].content = new_content;
+                // Update persistent_temperature if this message had a @p
+                if let Some(temp) = last_temp {
+                    persistent_temperature = Some(temp);
+                }
+            }
+        }
+        // After processing all messages, apply the last seen temperature if any
+        if let Some(temp) = persistent_temperature {
+            local_temperature = temp;
+            // Optional: Clamp to reasonable range (e.g., 0.0 to 2.0)
+            if local_temperature < 0.0 || local_temperature > 2.0 {
+                println!(
+                    "Warning: Specified temperature {} is outside typical range (0.0-2.0), using as-is.",
+                    local_temperature
+                );
+            }
+            println!("Setting `temperature` API parameter to {}", local_temperature);
         }
 
         // Expand other placeholders ONLY in user messages (prompts to the API)
@@ -319,132 +398,158 @@ async fn process_chat_file(
             });
         }
 
-        // Get API key, build client, create req
+        // Get API key, build client
         let api_key = env::var("XAI_API_KEY").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "XAI_API_KEY not set"))?;
         let client = Client::builder()
             .timeout(Duration::from_secs(api_timeout))
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-        let req = ChatRequest {
-            model: "grok-4-0709".to_string(),
-            messages: api_messages,  // Use api_messages (with or without system prompt)
-            temperature: 1.0,
-            max_tokens: local_max_tokens,
-        };
 
-        // Log the full request (DEBUG level)
-        log::debug!("Sending API request: {:?}", req);
+        // Inner loop for handling truncation retries (in-memory, no file re-read)
+        let mut needs_reprocess = false;
+        loop {
+            // Create request with current max_tokens
+            let req = ChatRequest {
+                model: model.to_string(),
+                messages: api_messages.clone(),  // Clone to keep immutable
+                temperature: local_temperature,
+                max_tokens: parse_level(current_level),
+            };
 
-        // Build the request but don't send yet
-        let request_builder = client
-            .post("https://api.x.ai/v1/chat/completions")
-            .header("Content-Type", "application/json")
-            .header("Authorization", format!("Bearer {}", api_key))
-            .json(&req);
+            // Log the full request (DEBUG level)
+            log::debug!("Sending API request: {:?}", req);
 
-        // Print thinking message
-        println!("{}", THINKING_MESSAGE);
+            // Build the request
+            let request_builder = client
+                .post("https://api.x.ai/v1/chat/completions")
+                .header("Content-Type", "application/json")
+                .header("Authorization", format!("Bearer {}", api_key))
+                .json(&req);
 
-        // Now send and await
-        let res = request_builder.send().await;
+            // Print thinking message with settings
+            println!("Grok is thinking... (max_tokens: {}, temperature: {})", req.max_tokens, local_temperature);
 
-        match res {
-            Ok(resp) if resp.status().is_success() => {
-                let chat_resp: ChatResponse = resp.json().await.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                let assistant_content = chat_resp.choices[0].message.content.clone();
+            // Send and await
+            let res = request_builder.send().await;
 
-                // Check if this is a file request (only if flag is enabled)
-                let mut is_file_request = false;
-                if auto_request_files {
-                    let trimmed = assistant_content.trim();
-                    if trimmed.starts_with("GROK REQUESTS FILES:") {
-                        let rest = trimmed.strip_prefix("GROK REQUESTS FILES:").unwrap().trim();
-                        // Ensure it's exactly the format (no extra content)
-                        if !rest.is_empty() && trimmed == format!("GROK REQUESTS FILES: {}", rest) {
-                            let paths: Vec<String> = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            match res {
+                Ok(resp) if resp.status().is_success() => {
+                    let chat_resp: ChatResponse = resp.json().await.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                    let assistant_content = chat_resp.choices[0].message.content.clone();
+                    let finish_reason = chat_resp.choices[0].finish_reason.clone();
 
-                            // Validate paths
-                            let cwd = env::current_dir().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                            let mut all_valid = true;
-                            let mut valid_paths = vec![];
-                            for p in paths.iter() {
-                                let path = PathBuf::from(p);
-                                // Block absolute paths or parent traversal
-                                if path.is_absolute() || p.starts_with("..") || p.contains("..") {
-                                    println!("Warning: Invalid path requested (traversal attempt): {}", p);
-                                    all_valid = false;
-                                    break;
-                                }
-                                // Canonicalize and check if within cwd
-                                let full_path = cwd.join(&path);
-                                match full_path.canonicalize() {
-                                    Ok(canon) if canon.starts_with(&cwd) => {
-                                        valid_paths.push(p.clone());
-                                    }
-                                    _ => {
-                                        println!("Warning: Path outside project or invalid: {}", p);
+                    // Check if this is a file request (only if flag is enabled)
+                    let mut is_file_request = false;
+                    if auto_request_files {
+                        let trimmed = assistant_content.trim();
+                        if trimmed.starts_with("GROK REQUESTS FILES:") {
+                            let rest = trimmed.strip_prefix("GROK REQUESTS FILES:").unwrap().trim();
+                            // Ensure it's exactly the format (no extra content)
+                            if !rest.is_empty() && trimmed == format!("GROK REQUESTS FILES: {}", rest) {
+                                let paths: Vec<String> = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+
+                                // Validate paths
+                                let cwd = env::current_dir().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                                let mut all_valid = true;
+                                let mut valid_paths = vec![];
+                                for p in paths.iter() {
+                                    let path = PathBuf::from(p);
+                                    // Block absolute paths or parent traversal
+                                    if path.is_absolute() || p.starts_with("..") || p.contains("..") {
+                                        println!("Warning: Invalid path requested (traversal attempt): {}", p);
                                         all_valid = false;
                                         break;
                                     }
+                                    // Canonicalize and check if within cwd
+                                    let full_path = cwd.join(&path);
+                                    match full_path.canonicalize() {
+                                        Ok(canon) if canon.starts_with(&cwd) => {
+                                            valid_paths.push(p.clone());
+                                        }
+                                        _ => {
+                                            println!("Warning: Path outside project or invalid: {}", p);
+                                            all_valid = false;
+                                            break;
+                                        }
+                                    }
                                 }
-                            }
 
-                            if all_valid && !valid_paths.is_empty() {
-                                // Append visible note and placeholders to the END of the file (augments the last USER PROMPT)
-                                let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
-                                writeln!(file, "\n\nGROK REQUESTED FILES:")?;
-                                for vp in valid_paths {
-                                    writeln!(file, "@f:{}", vp)?;  // No space after 'f'
+                                if all_valid && !valid_paths.is_empty() {
+                                    // Append visible note and placeholders to the END of the file (augments the last USER PROMPT)
+                                    let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
+                                    writeln!(file, "\n\nGROK REQUESTED FILES:")?;
+                                    for vp in valid_paths {
+                                        writeln!(file, "@f:{}", vp)?;  // No space after 'f'
+                                    }
+
+                                    // Set flag to reprocess (re-read file) and break inner loop
+                                    is_file_request = true;
+                                    needs_reprocess = true;
                                 }
-
-                                // Continue the loop to immediately re-process (no sleep needed, as we just wrote)
-                                is_file_request = true;
                             }
                         }
                     }
-                }
 
-                // If it was a valid file request, loop back without appending a response
-                if is_file_request {
-                    continue;
-                }
-
-                // Otherwise, treat as normal response
-                if let Some(reason) = &chat_resp.choices[0].finish_reason {
-                    if reason == "length" {
-                        println!("Warning: Response truncated due to max_tokens limit!");
+                    // If it was a valid file request, break inner loop to allow outer loop to re-read
+                    if is_file_request {
+                        break;
                     }
+
+                    // Check for truncation
+                    let is_truncated = finish_reason.as_ref().map(|r| r == "max_tokens" || r == "length").unwrap_or(false);
+                    if auto_increase_max_tokens && is_truncated && current_level < MAX_LEVEL {
+                        current_level += 1;
+                        println!(
+                            "Response truncated. Retrying with higher max_tokens: L{} ({} tokens)",
+                            current_level, parse_level(current_level)
+                        );
+                        // Continue inner loop to re-query with higher max_tokens
+                        continue;
+                    }
+
+                    // Otherwise, treat as final response
+                    println!("Grok has thought.");
+                    let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
+                    writeln!(
+                        file,
+                        "\n{}:\n{}\n\n{}:\n",
+                        GROK_RESPONSE_MARKER,
+                        assistant_content,
+                        USER_PROMPT_MARKER
+                    )?;
+
+                    // If still truncated at max level, print warning
+                    if is_truncated {
+                        println!("Warning: Response truncated even at max level L{} ({} tokens)!", MAX_LEVEL, parse_level(MAX_LEVEL));
+                    }
+
+                    // Play chime sound
+                    play_chime().await;
+
+                    // Break inner loop after handling final response
+                    break;
                 }
-                println!("Grok has thought.");
-                let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
-                writeln!(
-                    file,
-                    "\n{}:\n{}\n\n{}:\n",
-                    GROK_RESPONSE_MARKER,
-                    assistant_content,
-                    USER_PROMPT_MARKER
-                )?;
-
-                // Play chime sound
-                play_chime().await;
-
-                // Break the loop after handling a normal response
-                break;
+                Ok(resp) => {
+                    let status = resp.status();
+                    let err_body = resp.text().await.unwrap_or_default();
+                    println!("Grok failed to respond.");
+                    play_warning().await;
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("API error: {} - Body: {}", status, err_body)));
+                }
+                Err(e) => {
+                    println!("Grok failed to respond.");
+                    play_warning().await;
+                    return Err(io::Error::new(io::ErrorKind::Other, format!("Request error: {:?}", e)));
+                },
             }
-            Ok(resp) => {
-                let status = resp.status();
-                let err_body = resp.text().await.unwrap_or_default();
-                println!("Grok failed to respond.");
-                play_warning().await;
-                return Err(io::Error::new(io::ErrorKind::Other, format!("API error: {} - Body: {}", status, err_body)));
-            }
-            Err(e) => {
-                println!("Grok failed to respond.");
-                play_warning().await;
-                return Err(io::Error::new(io::ErrorKind::Other, format!("Request error: {:?}", e)));
-            },
+        }  // End inner loop
+
+        // After inner loop, check if we need to reprocess (e.g., for file requests)
+        if !needs_reprocess {
+            break;  // Done processing, break outer loop
         }
-    }
+        // Else, continue outer loop to re-read the updated file
+    }  // End outer loop
 
     Ok(())
 }
