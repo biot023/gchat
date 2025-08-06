@@ -1,4 +1,4 @@
-# Grok Chat File Watcher
+# Simple Grok 4 Dev 'Assistant'
 
 This works for me. I run it in the root of whatever project I'm working on and then edit and read the generated chat file. I work in `nvim`.
 
