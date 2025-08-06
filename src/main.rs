@@ -1,6 +1,4 @@
 use clap::Parser;
-use notify::{recommended_watcher, RecursiveMode, Watcher, Event};
-use notify::Result as NotifyResult;
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -9,13 +7,14 @@ use std::fs::{self, File};
 use std::io::{self, Write as IoWrite};
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, mpsc::{channel, Receiver}};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::time::sleep;
 use walkdir::WalkDir;
 use glob::glob;
-use rodio::{OutputStream, Sink, Source, source::SineWave};
+use rodio::{OutputStream, Sink, Source, source::SineWave, Decoder};
 use std::time::Duration as StdDuration;
+use std::io::Cursor;
+use log;  // New import for logging
 
 const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
@@ -27,7 +26,7 @@ struct Args {
     #[arg(short = 'f', long, default_value = "./gchat.md")]
     chat_file: String,
 
-    #[arg(short = 't', long, default_value = "4096")]
+    #[arg(short = 't', long, default_value = "16384")]
     max_tokens: u32,
 
     #[arg(short = 'T', long, default_value = "600")]
@@ -40,7 +39,7 @@ struct Message {
     content: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]  // Added Debug derive for logging
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
@@ -61,6 +60,8 @@ struct Choice {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    env_logger::init();  // Initialize logging (configure via RUST_LOG env var)
+
     let args = Args::parse();
     let chat_path = PathBuf::from(&args.chat_file);
 
@@ -80,94 +81,117 @@ async fn main() -> io::Result<()> {
     println!("  Max tokens: {}", args.max_tokens);
     println!("  API timeout: {} seconds", args.api_timeout);
 
-    let ignoring_next_change = Arc::new(Mutex::new(false));
-
-    let ignoring_clone = ignoring_next_change.clone();
-    let chat_path_clone = chat_path.clone();
-
-    println!("App started. Watching {} for changes.", args.chat_file);
+    println!("App started. Polling {} for changes every 1 second.", args.chat_file);
 
     // Initial process on startup
     if let Err(e) = process_chat_file(
-        &chat_path_clone,
+        &chat_path,
         args.max_tokens,
         args.api_timeout,
-        &ignoring_clone,
     )
     .await
     {
         println!("Processing error: {}", e);
     }
 
-    // Set up watcher
-    let (tx, rx): (std::sync::mpsc::Sender<NotifyResult<Event>>, Receiver<NotifyResult<Event>>) = channel();
-    let mut watcher = recommended_watcher(move |res| { let _ = tx.send(res); })
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-    watcher.watch(&chat_path_clone, RecursiveMode::NonRecursive)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    // Get initial modification time (or now if unavailable)
+    let mut last_mtime = fs::metadata(&chat_path)
+        .and_then(|meta| meta.modified())
+        .unwrap_or(SystemTime::now());
 
+    // Polling loop
     loop {
-        if let Ok(res) = rx.recv() {
-            match res {
-                Ok(event) if event.kind.is_modify() => {
-                    // Debounce
-                    sleep(Duration::from_millis(500)).await;
+        // Sleep for 1 second between checks
+        sleep(Duration::from_secs(1)).await;
 
-                    // Check if ignoring
-                    let mut ignore = ignoring_clone.lock().unwrap();
-                    if *ignore {
-                        *ignore = false;
-                        continue;
-                    }
+        // Get current modification time
+        let current_mtime = match fs::metadata(&chat_path) {
+            Ok(meta) => match meta.modified() {
+                Ok(mtime) => mtime,
+                Err(_) => continue, // Skip if can't get mtime
+            },
+            Err(_) => continue, // Skip if file doesn't exist temporarily
+        };
 
-                    if let Err(e) = process_chat_file(
-                        &chat_path_clone,
-                        args.max_tokens,
-                        args.api_timeout,
-                        &ignoring_clone,
-                    )
-                    .await
-                    {
-                        println!("Processing error: {}", e);
-                    }
-                }
-                Ok(_) => {}, // Ignore other kinds
-                Err(e) => println!("Watcher error: {}", e),
+        if current_mtime > last_mtime {
+            // File changed: process it
+            if let Err(e) = process_chat_file(
+                &chat_path,
+                args.max_tokens,
+                args.api_timeout,
+            )
+            .await
+            {
+                println!("Processing error: {}", e);
             }
-        } else {
-            break; // Channel closed
+            // Update last mtime after processing
+            last_mtime = current_mtime;
         }
     }
-
-    Ok(())
 }
 
 async fn process_chat_file(
     chat_path: &PathBuf,
     max_tokens: u32,
     api_timeout: u64,
-    ignoring_next_change: &Arc<Mutex<bool>>,
 ) -> io::Result<()> {
+    // Short debounce to ensure save is complete (helps with atomic saves)
+    sleep(Duration::from_millis(500)).await;
+
     let content = fs::read_to_string(chat_path)?;
     let mut messages = parse_chat_messages(&content);
 
-    println!("Parsed messages: {:?}", messages);
-
-    if messages.is_empty() || messages.last().unwrap().role != "user" {
-        println!("No user prompt to process in chat file.");
+    if messages.is_empty() || messages.last().unwrap().role != "user" || messages.last().unwrap().content.trim().is_empty() {
+        println!("No complete user prompt to process in chat file.");
         return Ok(()); // No send needed
     }
 
-    // Expand placeholders ONLY in user messages (prompts to the API)
+    // Handle @t placeholders: remove from all user messages, and set local_max_tokens from the last @t in the last user message
+    let mut local_max_tokens = max_tokens;
+    let re = Regex::new(r"@t\s*:\s*(\d+)").unwrap();
+    for i in 0..messages.len() {
+        if messages[i].role == "user" {
+            let content = &messages[i].content;
+            let mut new_content = content.to_string();
+            let mut last_num: Option<u32> = None;
+            let mut ranges = vec![];
+            for cap in re.captures_iter(content) {
+                let whole = cap.get(0).unwrap();
+                ranges.push(whole.range());
+                if let Some(num_str) = cap.get(1) {
+                    if let Ok(num) = num_str.as_str().parse::<u32>() {
+                        if num > 0 {
+                            last_num = Some(num);
+                        }
+                    }
+                }
+            }
+            // Remove in reverse order to avoid index issues
+            for range in ranges.into_iter().rev() {
+                new_content.replace_range(range, "");
+            }
+            messages[i].content = new_content;
+            // If this is the last message, apply the last_num if present
+            if i == messages.len() - 1 {
+                if let Some(num) = last_num {
+                    println!("Setting `max_tokens` API parameter to {}", num);
+                    local_max_tokens = num;
+                }
+            }
+        }
+    }
+
+    // Expand other placeholders ONLY in user messages (prompts to the API)
     for msg in messages.iter_mut() {
         if msg.role == "user" {
             msg.content = expand_placeholders(&msg.content)?;
         }
     }
 
-    println!("Sending to API: {:?}", messages);
+    // Log the expanded messages (DEBUG level)
+    log::debug!("Expanded messages for API request: {:?}", messages);
 
-    // Get API key, build client, create req (unchanged)
+    // Get API key, build client, create req
     let api_key = env::var("XAI_API_KEY").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "XAI_API_KEY not set"))?;
     let client = Client::builder()
         .timeout(Duration::from_secs(api_timeout))
@@ -177,8 +201,11 @@ async fn process_chat_file(
         model: "grok-4-0709".to_string(),
         messages,
         temperature: 1.0,
-        max_tokens,
+        max_tokens: local_max_tokens,
     };
+
+    // Log the full request (DEBUG level)
+    log::debug!("Sending API request: {:?}", req);
 
     // Build the request but don't send yet
     let request_builder = client
@@ -220,9 +247,6 @@ async fn process_chat_file(
             // Play chime sound
             play_chime().await;
 
-            // Set ignore flag
-            *ignoring_next_change.lock().unwrap() = true;
-
             Ok(())
         }
         Ok(resp) => {
@@ -242,28 +266,42 @@ async fn process_chat_file(
 
 fn parse_chat_messages(content: &str) -> Vec<Message> {
     let mut messages = Vec::new();
-    let grok_marker_with_newlines = format!("\n{}:\n", GROK_RESPONSE_MARKER);
-    let user_marker_with_newlines = format!("\n{}:\n", USER_PROMPT_MARKER);
+    let mut current_role: Option<String> = None;
+    let mut current_content = String::new();
 
-    let parts: Vec<&str> = content.split(&grok_marker_with_newlines).collect();
-
-    for (i, part) in parts.iter().enumerate() {
-        if i == 0 {
-            let trimmed = part.trim();
-            if !trimmed.is_empty() {
-                messages.push(Message { role: "user".to_string(), content: trimmed.to_string() });
-            }
-        } else {
-            let subparts: Vec<&str> = part.split(&user_marker_with_newlines).collect();
-            for (j, sub) in subparts.iter().enumerate() {
-                let trimmed = sub.trim();
+    for line in content.lines() {
+        if line == "USER PROMPT:" || line == "GROK RESPONSE:" {
+            // Add previous section if it exists and is non-empty
+            if let Some(role) = current_role.take() {
+                let trimmed = current_content.trim().to_string();
                 if !trimmed.is_empty() {
-                    let role = if j == 0 { "assistant" } else { "user" };
-                    messages.push(Message { role: role.to_string(), content: trimmed.to_string() });
+                    messages.push(Message {
+                        role,
+                        content: trimmed,
+                    });
                 }
             }
+
+            // Start new section
+            current_role = Some(if line == "USER PROMPT:" { "user".to_string() } else { "assistant".to_string() });
+            current_content.clear();
+        } else {
+            // Append to current content
+            writeln!(&mut current_content, "{}", line).expect("Failed to write to String");
         }
     }
+
+    // Add the last section if it exists and is non-empty
+    if let Some(role) = current_role {
+        let trimmed = current_content.trim().to_string();
+        if !trimmed.is_empty() {
+            messages.push(Message {
+                role,
+                content: trimmed,
+            });
+        }
+    }
+
     messages
 }
 
@@ -280,14 +318,22 @@ fn expand_placeholders(text: &str) -> io::Result<String> {
 
         if let Some(file_path) = cap.get(1) {
             let path_str = file_path.as_str();
-            let expanded = expand_file_path(path_str)
-                .map_err(|e| io::Error::new(e.kind(), format!("Error: Failed to expand file placeholder '{}': {} (path: {})", placeholder, e, path_str)))?;
-            result.push_str(&expanded);
+            match expand_file_path(path_str) {
+                Ok(expanded) => result.push_str(&expanded),
+                Err(e) => {
+                    println!("Warning: Failed to expand file placeholder '{}' : {} (path: {})", placeholder, e, path_str);
+                    result.push_str(placeholder);
+                }
+            }
         } else if let Some(dir_path) = cap.get(2) {
             let path_str = dir_path.as_str();
-            let expanded = expand_dir_tree(path_str)
-                .map_err(|e| io::Error::new(e.kind(), format!("Error: Failed to expand directory placeholder '{}': {} (path: {})", placeholder, e, path_str)))?;
-            result.push_str(&expanded);
+            match expand_dir_tree(path_str) {
+                Ok(expanded) => result.push_str(&expanded),
+                Err(e) => {
+                    println!("Warning: Failed to expand directory placeholder '{}' : {} (path: {})", placeholder, e, path_str);
+                    result.push_str(placeholder);
+                }
+            }
         }
 
         last_end = match_range.end();
@@ -303,19 +349,17 @@ fn expand_file_path(path_str: &str) -> io::Result<String> {
 
     if path_str.contains('*') || path_str.contains('?') {
         // Glob
-        let mut paths: Vec<_> = glob(path_str).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?.filter_map(Result::ok).collect();
-        if paths.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "No files matched the glob pattern"));
+        let mut files: Vec<_> = glob(path_str)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
+            .filter_map(|res| res.ok().filter(|p| p.is_file()))
+            .collect();
+        if files.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, "No files matched the pattern"));
         }
-        paths.sort();
-        for p in paths {
-            if !p.exists() {
-                return Err(io::Error::new(io::ErrorKind::NotFound, format!("File not found: {}", p.display())));
-            }
-            if p.is_file() {
-                let content = fs::read_to_string(&p)?;
-                writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", p.display(), content).expect("Failed to write to String");
-            }
+        files.sort();
+        for p in files {
+            let content = fs::read_to_string(&p)?;
+            writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", p.display(), content).expect("Failed to write to String");
         }
     } else if path.is_dir() {
         // Directory recurse
@@ -379,20 +423,18 @@ fn expand_dir_tree(path_str: &str) -> io::Result<String> {
     Ok(output)
 }
 
-// Play a pleasant chime sound (ascending tones)
+// Play a pleasant chime sound from bundled MP3
 async fn play_chime() {
     tokio::task::spawn_blocking(|| {
         let (_stream, stream_handle) = OutputStream::try_default().expect("Failed to get default output stream");
         let sink = Sink::try_new(&stream_handle).expect("Failed to create sink");
 
-        // Chime: three ascending sine waves (e.g., 440Hz, 523Hz, 659Hz for A4, C5, E5 notes)
-        let frequencies = [440, 523, 659];
-        for freq in frequencies {
-            let source = SineWave::new(freq as f32).take_duration(StdDuration::from_millis(200)).amplify(0.20); // Short, soft tone
-            sink.append(source);
-            std::thread::sleep(StdDuration::from_millis(50)); // Small gap between tones
-        }
+        // Bundle the MP3 file into the binary
+        let bytes = include_bytes!("../media/chime.mp3");
+        let cursor = Cursor::new(bytes.as_ref());
+        let source = Decoder::new(cursor).expect("Failed to decode MP3");
 
+        sink.append(source);
         sink.sleep_until_end(); // Wait for playback to finish
     })
     .await
