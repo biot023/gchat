@@ -22,7 +22,57 @@ const THINKING_MESSAGE: &str = "Grok is thinking...";
 const MAX_LEVEL: u32 = 5; // Corresponds to L5 = 16384, as per original default
 
 #[derive(Parser, Debug)]
-#[command(version, about)]
+#[command(
+    version,
+    about = "A utility to communicate with the Grok 4 API via a watched chat file.",
+    long_about = r#"
+A utility to communicate with the Grok 4 API by watching a Markdown chat file (default: ./gchat.md).
+The app polls the file every 1 second for changes. When a new user prompt is detected (marked by "USER PROMPT:"),
+it sends the conversation history to the Grok API, appends the response (marked by "GROK RESPONSE:"),
+and adds a new "USER PROMPT:" section for your next input. Plays a chime on success or a warning sound on failure.
+
+### Setup
+- Set the XAI_API_KEY environment variable with your Grok API key (e.g., export XAI_API_KEY=your_key).
+- Optionally, set RUST_LOG for logging (e.g., RUST_LOG=debug for detailed output, including API requests/responses).
+- Run the app: cargo run -- [options]. It runs indefinitely until killed (e.g., Ctrl+C).
+
+### Basic Usage
+1. Start the app. It creates ./gchat.md if it doesn't exist.
+2. Edit ./gchat.md in your text editor:
+   - Add your prompt under a "USER PROMPT:" marker.
+   - Save the file. The app detects the change, sends it to Grok, and appends the response.
+   - Example file content:
+     USER PROMPT:
+     Hello, Grok!
+
+     GROK RESPONSE:
+     Hello! How can I help?
+
+     USER PROMPT:
+     What's the weather like? (This will be sent next)
+3. The app processes only if the last section is a non-empty "USER PROMPT:".
+4. On startup, it processes any pending user prompt in the file.
+
+### Placeholders in User Prompts
+These are expanded ONLY in "USER PROMPT:" sections before sending to the API:
+- @f :path - Include file contents (e.g., @f :./file.txt). Supports globs (e.g., @f :./*.rs) or directories (recursively includes all files).
+- @d :path - Include directory tree listing (e.g., @d :./src). Shows files and subdirs recursively.
+- @t :L<level> - Set max_tokens for this prompt (e.g., @t :L3 for 4096 tokens). Removed after processing; last @t in the prompt wins. Levels: L0 (512) to L5 (16384).
+
+Placeholders are removed/expanded before API calls. Warnings are printed on expansion errors.
+
+### Command-Line Options
+- -f/--chat-file: Path to the chat file (default: ./gchat.md).
+- -t/--max-tokens: Default max_tokens level (e.g., L5 for 16384; max L5). Overridable per-prompt with @t.
+- -T/--api-timeout: API request timeout in seconds (default: 600).
+
+### Notes
+- Requires the 'rodio' crate for sounds (ensure audio dependencies are installed).
+- Logs to stderr (configure with RUST_LOG env var).
+- If response is truncated (due to max_tokens), a warning is printed.
+- Errors (e.g., API failures) play a warning sound and print details.
+"#
+)]
 struct Args {
     #[arg(short = 'f', long, default_value = "./gchat.md")]
     chat_file: String,
