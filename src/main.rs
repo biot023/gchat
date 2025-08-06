@@ -4,10 +4,9 @@ use notify::Result as NotifyResult;
 use regex::Regex;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::env;
 use std::fs::{self, File};
-use std::io::{self, BufRead, Write as IoWrite};
+use std::io::{self, Write as IoWrite};
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, mpsc::{channel, Receiver}};
@@ -25,10 +24,7 @@ const THINKING_MESSAGE: &str = "Grok is thinking...";
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    #[arg(short, long, default_value = "./g4a-placeholders")]
-    placeholders_file: String,
-
-    #[arg(short, long, default_value = "./g4a-chat.md")]
+    #[arg(short = 'f', long, default_value = "./gchat.md")]
     chat_file: String,
 
     #[arg(short = 't', long, default_value = "4096")]
@@ -66,17 +62,7 @@ struct Choice {
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args = Args::parse();
-    let placeholders_path = PathBuf::from(&args.placeholders_file);
     let chat_path = PathBuf::from(&args.chat_file);
-
-    // Create placeholders file if it doesn't exist
-    if !placeholders_path.exists() {
-        File::create(&chat_path)?;
-        println!(
-            "Created placeholders file at {}. You can populate it with shorthands like @key = path/to/file_or_dir",
-            placeholders_path.display()
-        );
-    }
 
     // Create chat file if it doesn't exist
     if !chat_path.exists() {
@@ -88,29 +74,16 @@ async fn main() -> io::Result<()> {
         );
     }
 
-    let shorthands = load_placeholders(&placeholders_path)?;
-
-    // Print settings and placeholders on startup
+    // Print settings on startup
     println!("Running with settings:");
-    println!("  Placeholders file: {}", args.placeholders_file);
     println!("  Chat file: {}", args.chat_file);
     println!("  Max tokens: {}", args.max_tokens);
     println!("  API timeout: {} seconds", args.api_timeout);
-
-    println!("Registered placeholders:");
-    if shorthands.is_empty() {
-        println!("  (None)");
-    } else {
-        for (key, value) in &shorthands {
-            println!("  @{} = {}", key, value);
-        }
-    }
 
     let ignoring_next_change = Arc::new(Mutex::new(false));
 
     let ignoring_clone = ignoring_next_change.clone();
     let chat_path_clone = chat_path.clone();
-    let shorthands_clone = shorthands.clone();
 
     println!("App started. Watching {} for changes.", args.chat_file);
 
@@ -119,7 +92,6 @@ async fn main() -> io::Result<()> {
         &chat_path_clone,
         args.max_tokens,
         args.api_timeout,
-        &shorthands_clone,
         &ignoring_clone,
     )
     .await
@@ -152,7 +124,6 @@ async fn main() -> io::Result<()> {
                         &chat_path_clone,
                         args.max_tokens,
                         args.api_timeout,
-                        &shorthands_clone,
                         &ignoring_clone,
                     )
                     .await
@@ -175,7 +146,6 @@ async fn process_chat_file(
     chat_path: &PathBuf,
     max_tokens: u32,
     api_timeout: u64,
-    shorthands: &HashMap<String, String>,
     ignoring_next_change: &Arc<Mutex<bool>>,
 ) -> io::Result<()> {
     let content = fs::read_to_string(chat_path)?;
@@ -191,7 +161,7 @@ async fn process_chat_file(
     // Expand placeholders ONLY in user messages (prompts to the API)
     for msg in messages.iter_mut() {
         if msg.role == "user" {
-            msg.content = expand_placeholders(&msg.content, shorthands)?;
+            msg.content = expand_placeholders(&msg.content)?;
         }
     }
 
@@ -297,27 +267,8 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
     messages
 }
 
-fn load_placeholders(path: &PathBuf) -> io::Result<HashMap<String, String>> {
-    let mut shorthands = HashMap::new();
-    if path.exists() {
-        let file = File::open(path)?;
-        for line in io::BufReader::new(file).lines() {
-            let line = line?;
-            let trimmed = line.trim();
-            if trimmed.starts_with('@') {
-                if let Some(eq_pos) = trimmed.find('=') {
-                    let key = trimmed[1..eq_pos].trim().to_string();
-                    let value = trimmed[eq_pos + 1..].trim().to_string();
-                    shorthands.insert(key, value);
-                }
-            }
-        }
-    }
-    Ok(shorthands)
-}
-
-fn expand_placeholders(text: &str, shorthands: &HashMap<String, String>) -> io::Result<String> {
-    let re = Regex::new(r"@f\s*:(\S+)|@d\s*:(\S+)|@(\w+)").unwrap();
+fn expand_placeholders(text: &str) -> io::Result<String> {
+    let re = Regex::new(r"@f\s*:(\S+)|@d\s*:(\S+)").unwrap();
     let mut result = String::new();
     let mut last_end = 0;
 
@@ -337,18 +288,6 @@ fn expand_placeholders(text: &str, shorthands: &HashMap<String, String>) -> io::
             let expanded = expand_dir_tree(path_str)
                 .map_err(|e| io::Error::new(e.kind(), format!("Error: Failed to expand directory placeholder '{}': {} (path: {})", placeholder, e, path_str)))?;
             result.push_str(&expanded);
-        } else if let Some(shorthand) = cap.get(3) {
-            let shorthand_key = shorthand.as_str();
-            if let Some(path) = shorthands.get(shorthand_key) {
-                let expanded = expand_file_path(path)
-                    .map_err(|e| io::Error::new(e.kind(), format!("Error: Failed to expand shorthand placeholder '{}' (resolved to '{}'): {}", placeholder, path, e)))?;
-                result.push_str(&expanded);
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("Error: Placeholder '{}' not found in shorthands", placeholder)
-                ));
-            }
         }
 
         last_end = match_range.end();
