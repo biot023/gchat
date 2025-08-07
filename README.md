@@ -39,7 +39,7 @@ This tool is ideal for users who prefer editing a file in their favorite text ed
 - **Truncation Handling**: Warns if the API response is truncated due to token limits. Optional auto-increase feature to retry with higher limits.
 - **Initial Processing**: On startup, processes any pending user prompt in the file.
 - **Auto File Requests**: Optional feature (enabled with `--auto-request-files` or `-a`). Allows Grok to request files from your project directory if needed to answer queries. Grok responds in a specific format ("GROK REQUESTS FILES: relative/path1, relative/path2"), and the utility automatically appends placeholders (e.g., `@f:src/main.rs`) to the last user prompt, then re-queries the API with the contents included. This chains until a normal response is received. Paths are validated to stay within the project directory (no absolute paths or parent traversal). Supports globs and directories if requested.
-- **Auto-Increase Max Tokens**: Optional feature (enabled with `--auto-increase-max-tokens` or `-i`). Automatically retries truncated responses with incrementally higher `max_tokens` levels (up to L5) until non-truncated or max is reached.
+- **Auto-Increase Max Tokens**: Optional feature (enabled with `--auto-increase-max-tokens` or `-i`). Automatically retries truncated responses with incrementally higher `max_tokens` levels (up to L7) until non-truncated or max is reached.
 
 ## Installation
 
@@ -110,7 +110,7 @@ Use `cargo run -- --help` for full details. Key options:
 - `-m, --model <STRING>`: The Grok model to call (default: `grok-4`).
 - `-T, --api-timeout <SECONDS>`: API request timeout (default: 600 seconds).
 - `-a, --auto-request-files`: Enable Grok to automatically request and include project files if needed (default: false). See "Auto File Requests" below for details.
-- `-i, --auto-increase-max-tokens`: Automatically increase max_tokens level on truncation (up to L5) by re-querying (default: false). See "Auto-Increase Max Tokens" below for details.
+- `-i, --auto-increase-max-tokens`: Automatically increase max_tokens level on truncation (up to L7) by re-querying (default: false). See "Auto-Increase Max Tokens" below for details.
 
 Example:
 ```
@@ -175,15 +175,10 @@ The `--max-tokens` option and `@t` placeholder use "L" levels to specify `max_to
 - **L2**: 2048 tokens
 - **L3**: 4096 tokens
 - **L4**: 8192 tokens
-- **L5**: 16384 tokens (maximum; higher levels are capped at L5)
+- **L5**: 16384 tokens
+- **L6**: 32768 tokens
+- **L7**: 65536 tokens (maximum; higher levels are capped at L7)
 
-Format: `L<digit>`, e.g., `L5`. Invalid formats (e.g., `L6` or `512`) will error or cap at L5 with a warning.
-
-- CLI: `--max-tokens L3` sets default to 4096.
-- Per-prompt: `@t:L2` in any user message overrides to 2048 for the request (last one wins).
-- If the response is truncated (hits the limit), a warning is printed: "Warning: Response truncated due to max_tokens limit!"
-
-Higher levels allow longer responses but may increase API costs/latency.
 
 ### Auto File Requests
 Enabled with `--auto-request-files` (or `-a`). This allows Grok to request files from your project directory (current working directory) if it needs them to answer a query better.
@@ -206,7 +201,7 @@ Example:
 - App appends to prompt and re-queries with file contents included.
 
 ### Auto-Increase Max Tokens
-Enabled with `--auto-increase-max-tokens` (or `-i`). When a response is truncated (finish_reason: "max_tokens" or "length"), the utility automatically increments the max_tokens level (from the current prompt's level or default) and re-queries with the same messages but higher max_tokens (e.g., from L3 to L4). This chains until a non-truncated response or L5 is reached. If still truncated at L5, appends with a warning.
+Enabled with `--auto-increase-max-tokens` (or `-i`). When a response is truncated (finish_reason: "max_tokens" or "length"), the utility automatically increments the max_tokens level (from the current prompt's level or default) and re-queries with the same messages but higher max_tokens (e.g., from L3 to L4). This chains until a non-truncated response or L7 is reached. If still truncated at L7, appends with a warning.
 
 Retries are handled in-memory (no file changes until final response). Console shows retry attempts (e.g., "Response truncated. Retrying with L4 (8192 tokens)").
 

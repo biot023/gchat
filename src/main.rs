@@ -20,7 +20,7 @@ use toml;
 
 const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
-const MAX_LEVEL: u32 = 5;
+const MAX_LEVEL: u32 = 7;
 
 const SYSTEM_INSTRUCTIONS: &str = r#"
 You are Grok, a helpful AI. If you need the contents of files to better answer the user's query, you can request them by responding with EXACTLY this format and NOTHING ELSE:
@@ -94,9 +94,8 @@ async fn main() -> io::Result<()> {
                 io::Error::new(io::ErrorKind::InvalidData, e)
             })?;
             println!("Loaded config from {}", config_path.display());
-            println!("DEBUG: Loaded config values: {:?}", config);
         } else {
-            println!("DEBUG: No config file found at {}", config_path.display());
+            println!("No config file found at {}", config_path.display());
         }
     }
 
@@ -154,30 +153,6 @@ async fn main() -> io::Result<()> {
         );
 
     let matches = app.get_matches();
-
-    // Debug prints for ALL relevant args/flags
-    println!("DEBUG: CLI contains chat_file: {}", matches.contains_id("chat_file"));
-    if matches.contains_id("chat_file") {
-        println!("DEBUG: CLI chat_file value: {}", matches.get_one::<String>("chat_file").unwrap());
-    }
-    println!("DEBUG: CLI contains max_tokens: {}", matches.contains_id("max_tokens"));
-    if matches.contains_id("max_tokens") {
-        println!("DEBUG: CLI max_tokens value: {}", matches.get_one::<String>("max_tokens").unwrap());
-    }
-    println!("DEBUG: CLI contains temperature: {}", matches.contains_id("temperature"));
-    if matches.contains_id("temperature") {
-        println!("DEBUG: CLI temperature value: {}", matches.get_one::<String>("temperature").unwrap());
-    }
-    println!("DEBUG: CLI contains model: {}", matches.contains_id("model"));
-    if matches.contains_id("model") {
-        println!("DEBUG: CLI model value: {}", matches.get_one::<String>("model").unwrap());
-    }
-    println!("DEBUG: CLI contains api_timeout: {}", matches.contains_id("api_timeout"));
-    if matches.contains_id("api_timeout") {
-        println!("DEBUG: CLI api_timeout value: {}", matches.get_one::<String>("api_timeout").unwrap());
-    }
-    println!("DEBUG: CLI contains auto_request_files: {}", matches.contains_id("auto_request_files"));
-    println!("DEBUG: CLI contains auto_increase_max_tokens: {}", matches.contains_id("auto_increase_max_tokens"));
 
     // Extract final values: CLI overrides config overrides defaults
     let chat_file = if matches.contains_id("chat_file") {
@@ -317,15 +292,15 @@ fn get_level_from_str(s: &str) -> Result<u32, String> {
         match lstr.parse::<u32>() {
             Ok(level) if level <= MAX_LEVEL => Ok(level),
             Ok(level) => Err(format!(
-                "Level too high: L{}, max L{} ({} tokens)",
-                level,
-                MAX_LEVEL,
-                512u32 << MAX_LEVEL
+                    "Level too high: L{}, max L{} ({} tokens)",
+                    level,
+                    MAX_LEVEL,
+                    512u32 << MAX_LEVEL
             )),
-            Err(_) => Err("Invalid level: expected L followed by a number (e.g., L5)".to_string()),
+            Err(_) => Err("Invalid level: expected L followed by a number (e.g., L7)".to_string()),
         }
     } else {
-        Err("Invalid format: expected L<level> (e.g., L5)".to_string())
+        Err("Invalid format: expected L<level> (e.g., L7)".to_string())
     }
 }
 
