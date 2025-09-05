@@ -434,10 +434,19 @@ async fn process_chat_file(
         }
 
         // Expand other placeholders ONLY in user messages (prompts to the API)
+        let mut any_expansion_error = false;
         for msg in messages.iter_mut() {
             if msg.role == "user" {
-                msg.content = expand_placeholders(&msg.content)?;
+                let (expanded, had_error) = expand_placeholders(&msg.content)?;
+                msg.content = expanded;
+                any_expansion_error |= had_error;
             }
+        }
+
+        // If there were any expansion errors, play warning sound and notify user
+        if any_expansion_error {
+            println!("Warning: Issues encountered while expanding placeholders (e.g., file not found or invalid path). Details are included in the prompt sent to Grok. Check debug logs for full expanded content.");
+            play_warning().await;
         }
 
         // Log the expanded messages (DEBUG level)
@@ -641,10 +650,11 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
     messages
 }
 
-fn expand_placeholders(text: &str) -> io::Result<String> {
+fn expand_placeholders(text: &str) -> io::Result<(String, bool)> {
     let re = Regex::new(r"@f\s*:(\S+)|@d\s*:(\S+)").unwrap();
     let mut result = String::new();
     let mut last_end = 0;
+    let mut had_error = false;
 
     let cwd = env::current_dir()?;
 
@@ -655,24 +665,27 @@ fn expand_placeholders(text: &str) -> io::Result<String> {
 
         if let Some(file_path) = cap.get(1) {
             let path_str = file_path.as_str();
-            let expanded = expand_file_path(path_str, &cwd);
+            let (expanded, err) = expand_file_path(path_str, &cwd);
             result.push_str(&expanded);
+            had_error |= err;
         } else if let Some(dir_path) = cap.get(2) {
             let path_str = dir_path.as_str();
-            let expanded = expand_dir_tree(path_str, &cwd);
+            let (expanded, err) = expand_dir_tree(path_str, &cwd);
             result.push_str(&expanded);
+            had_error |= err;
         }
 
         last_end = match_range.end();
     }
 
     result.push_str(&text[last_end..]);
-    Ok(result)
+    Ok((result, had_error))
 }
 
-fn expand_file_path(path_str: &str, cwd: &Path) -> String {
+fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool) {
     let path = Path::new(path_str);
     let mut output = String::new();
+    let mut had_error = false;
 
     if path_str.contains('*') || path_str.contains('?') {
         // Glob
@@ -680,7 +693,9 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> String {
             Ok(iter) => {
                 let mut files: Vec<_> = iter.filter_map(|res| res.ok()).filter(|p| p.is_file()).collect();
                 if files.is_empty() {
-                    return format!("No files matched the pattern {}.\n", path_str);
+                    had_error = true;
+                    let _ = writeln!(output, "No files matched the pattern {}.\n", path_str);
+                    return (output, had_error);
                 }
                 files.sort();
                 for p in files {
@@ -691,33 +706,41 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> String {
                                     let _ = writeln!(output, "Contents of {}:\n```\n{}\n```\n", p.display(), content);
                                 }
                                 Err(e) => {
+                                    had_error = true;
                                     let _ = writeln!(output, "Failed to read file {}: {}.\n", p.display(), e);
                                 }
                             }
                         }
                         _ => {
+                            had_error = true;
                             let _ = writeln!(output, "The requested file {} is unavailable (outside project or invalid).\n", p.display());
                         }
                     }
                 }
             }
             Err(e) => {
-                return format!("Invalid glob pattern {}: {}.\n", path_str, e);
+                had_error = true;
+                let _ = writeln!(output, "Invalid glob pattern {}: {}.\n", path_str, e);
             }
         }
     } else if path.is_dir() {
         // Directory recurse
         if !path.exists() {
-            return format!("The requested directory {} does not exist.\n", path_str);
+            had_error = true;
+            let _ = writeln!(output, "The requested directory {} does not exist.\n", path_str);
+            return (output, had_error);
         }
         if !path.is_dir() {
-            return format!("The path {} is not a directory.\n", path_str);
+            had_error = true;
+            let _ = writeln!(output, "The path {} is not a directory.\n", path_str);
+            return (output, had_error);
         }
         match path.canonicalize() {
             Ok(canon) if canon.starts_with(cwd) => {
                 let mut entries: Vec<_> = WalkDir::new(path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).collect();
                 if entries.is_empty() {
                     let _ = writeln!(output, "No files found in directory {}.\n", path.display());
+                    // Note: Not considering empty dir as error
                 } else {
                     entries.sort_by_key(|e| e.path().to_owned());
                     for entry in entries {
@@ -729,11 +752,13 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> String {
                                         let _ = writeln!(output, "Contents of {}:\n```\n{}\n```\n", ep.display(), content);
                                     }
                                     Err(e) => {
+                                        had_error = true;
                                         let _ = writeln!(output, "Failed to read file {}: {}.\n", ep.display(), e);
                                     }
                                 }
                             }
                             _ => {
+                                had_error = true;
                                 let _ = writeln!(output, "The requested file {} is unavailable.\n", ep.display());
                             }
                         }
@@ -741,7 +766,8 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> String {
                 }
             }
             _ => {
-                return format!("The requested directory {} is unavailable (outside project or invalid).\n", path_str);
+                had_error = true;
+                let _ = writeln!(output, "The requested directory {} is unavailable (outside project or invalid).\n", path_str);
             }
         }
     } else {
@@ -753,27 +779,33 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> String {
                         let _ = writeln!(output, "Contents of {}:\n```\n{}\n```\n", path.display(), content);
                     }
                     Err(e) => {
+                        had_error = true;
                         let _ = writeln!(output, "Failed to read file {}: {}.\n", path.display(), e);
                     }
                 }
             }
             _ => {
                 // Covers not found, outside project, etc.
-                return format!("The requested file {} does not exist or is unavailable.\n", path_str);
+                had_error = true;
+                let _ = writeln!(output, "The requested file {} does not exist or is unavailable.\n", path_str);
             }
         }
     }
 
-    output
+    (output, had_error)
 }
 
-fn expand_dir_tree(path_str: &str, cwd: &Path) -> String {
+fn expand_dir_tree(path_str: &str, cwd: &Path) -> (String, bool) {
     let path = Path::new(path_str);
+    let mut had_error = false;
+
     if !path.exists() {
-        return format!("The requested directory {} does not exist.\n", path_str);
+        had_error = true;
+        return (format!("The requested directory {} does not exist.\n", path_str), had_error);
     }
     if !path.is_dir() {
-        return format!("The path {} is not a directory.\n", path_str);
+        had_error = true;
+        return (format!("The path {} is not a directory.\n", path_str), had_error);
     }
 
     match path.canonicalize() {
@@ -782,6 +814,7 @@ fn expand_dir_tree(path_str: &str, cwd: &Path) -> String {
             let mut entries: Vec<_> = WalkDir::new(path).min_depth(1).into_iter().filter_map(|e| e.ok()).collect();
             if entries.is_empty() {
                 output.push_str("(empty directory)\n");
+                // Note: Not considering empty dir as error
             } else {
                 entries.sort_by_key(|e| e.path().to_owned());
                 for entry in entries {
@@ -795,10 +828,11 @@ fn expand_dir_tree(path_str: &str, cwd: &Path) -> String {
                 }
             }
             output.push_str("```\n");
-            output
+            (output, had_error)
         }
         _ => {
-            format!("The requested directory {} is unavailable (outside project or invalid).\n", path_str)
+            had_error = true;
+            (format!("The requested directory {} is unavailable (outside project or invalid).\n", path_str), had_error)
         }
     }
 }
@@ -840,3 +874,4 @@ async fn play_warning() {
     .await
     .expect("Failed to play warning");
 }
+
