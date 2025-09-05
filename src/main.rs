@@ -468,6 +468,9 @@ async fn process_chat_file(
             .build()
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
 
+        // ------ NEW: Start timing here, before the inner loop ------
+        let start_time = SystemTime::now();
+
         // Inner loop for handling truncation retries (in-memory, no file re-read)
         let mut needs_reprocess = false;
         loop {
@@ -488,6 +491,9 @@ async fn process_chat_file(
                 .header("Content-Type", "application/json")
                 .header("Authorization", format!("Bearer {}", api_key))
                 .json(&req);
+
+            // Play thinking sound
+            play_thinking().await;
 
             // Print thinking message with settings
             println!("Grok is thinking... (max_tokens: {}, temperature: {})", req.max_tokens, local_temperature);
@@ -565,7 +571,10 @@ async fn process_chat_file(
                     }
 
                     // Otherwise, treat as final response
-                    println!("Grok has thought.");
+                    // ------ NEW: Calculate elapsed time ------
+                    let elapsed = start_time.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+                    println!("Grok has thought ({} seconds).", elapsed);
+
                     let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
                     writeln!(
                         file,
@@ -837,6 +846,24 @@ fn expand_dir_tree(path_str: &str, cwd: &Path) -> (String, bool) {
     }
 }
 
+// Play a thinking sound from bundled MP3
+async fn play_thinking() {
+    tokio::task::spawn_blocking(|| {
+        let (_stream, stream_handle) = OutputStream::try_default().expect("Failed to get default output stream");
+        let sink = Sink::try_new(&stream_handle).expect("Failed to create sink");
+
+        // Bundle the MP3 file into the binary
+        let bytes = include_bytes!("../media/thinking.mp3");
+        let cursor = Cursor::new(bytes.as_ref());
+        let source = Decoder::new(cursor).expect("Failed to decode MP3");
+
+        sink.append(source);
+        sink.sleep_until_end(); // Wait for playback to finish
+    })
+    .await
+    .expect("Failed to play thinking sound");
+}
+
 // Play a pleasant chime sound from bundled MP3
 async fn play_chime() {
     tokio::task::spawn_blocking(|| {
@@ -874,4 +901,3 @@ async fn play_warning() {
     .await
     .expect("Failed to play warning");
 }
-
