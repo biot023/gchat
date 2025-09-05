@@ -8,6 +8,7 @@ use std::io::{self, Write as IoWrite};
 use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
+use std::path::Component;
 use tokio::time::sleep;
 use walkdir::WalkDir;
 use glob::glob;
@@ -22,10 +23,19 @@ const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
 const MAX_LEVEL: u32 = 7;
 
+// const SYSTEM_INSTRUCTIONS: &str = r#"
+// You are Grok, a helpful AI. If you need the contents of files to better answer the user's query, you can request them by responding with EXACTLY this format and NOTHING ELSE:
+// GROK REQUESTS FILES: relative/path1, relative/path2
+// Paths must be relative to the current working directory (e.g., src/main.rs, not /absolute/path or ../outside). Do not request files outside the project directory. You can request multiple files, directories, or globs (e.g., src/*.rs). The system will automatically include their contents in the next user message. Request all needed files at once if possible. You may request again if more are needed after seeing the contents.
+// "#;
 const SYSTEM_INSTRUCTIONS: &str = r#"
-You are Grok, a helpful AI. If you need the contents of files to better answer the user's query, you can request them by responding with EXACTLY this format and NOTHING ELSE:
+You are Grok, a helpful AI. **To provide the most accurate and helpful responses, actively request the contents of relevant files whenever you need them to verify assumptions, check details, or gather more context—even if the user hasn't explicitly asked. For example, if a query involves code, configurations, or project structure, request the necessary files proactively.**
+
+If you decide to request files, respond with **EXACTLY** this format and **NOTHING ELSE**:
 GROK REQUESTS FILES: relative/path1, relative/path2
 Paths must be relative to the current working directory (e.g., src/main.rs, not /absolute/path or ../outside). Do not request files outside the project directory. You can request multiple files, directories, or globs (e.g., src/*.rs). The system will automatically include their contents in the next user message. Request all needed files at once if possible. You may request again if more are needed after seeing the contents.
+
+**Only request files when they are genuinely needed to improve your response. If you have sufficient information, provide a direct answer without requesting.**
 "#;
 
 const DEFAULT_CHAT_FILE: &str = "./gchat.md";
@@ -35,6 +45,10 @@ const DEFAULT_MODEL: &str = "grok-4";
 const DEFAULT_API_TIMEOUT: &str = "600";
 const DEFAULT_AUTO_REQUEST_FILES: bool = false;
 const DEFAULT_AUTO_INCREASE_MAX_TOKENS: bool = false;
+
+fn contains_traversal(p: &str) -> bool {
+    Path::new(p).components().any(|c| matches!(c, Component::ParentDir))
+}
 
 #[derive(Deserialize, Debug)]
 struct Config {
@@ -479,8 +493,7 @@ async fn process_chat_file(
                     let finish_reason = chat_resp.choices[0].finish_reason.clone();
 
                     // Check if this is a file request (only if flag is enabled)
-                    let mut is_file_request = false;
-                    if auto_request_files {
+                    let is_file_request = if auto_request_files {
                         let trimmed = assistant_content.trim();
                         if trimmed.starts_with("GROK REQUESTS FILES:") {
                             let rest = trimmed.strip_prefix("GROK REQUESTS FILES:").unwrap().trim();
@@ -488,30 +501,17 @@ async fn process_chat_file(
                             if !rest.is_empty() && trimmed == format!("GROK REQUESTS FILES: {}", rest) {
                                 let paths: Vec<String> = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
-                                // Validate paths
-                                let cwd = env::current_dir().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                                // Validate paths (syntactic only: no absolute, no traversal)
                                 let mut all_valid = true;
                                 let mut valid_paths = vec![];
                                 for p in paths.iter() {
                                     let path = PathBuf::from(p);
-                                    // Block absolute paths or parent traversal
-                                    if path.is_absolute() || p.starts_with("..") || p.contains("..") {
-                                        println!("Warning: Invalid path requested (traversal attempt): {}", p);
+                                    if path.is_absolute() || p.starts_with("..") || p.contains("..") || contains_traversal(p) {
+                                        println!("Warning: Invalid path requested (traversal or absolute): {}", p);
                                         all_valid = false;
                                         break;
                                     }
-                                    // Canonicalize and check if within cwd
-                                    let full_path = cwd.join(&path);
-                                    match full_path.canonicalize() {
-                                        Ok(canon) if canon.starts_with(&cwd) => {
-                                            valid_paths.push(p.clone());
-                                        }
-                                        _ => {
-                                            println!("Warning: Path outside project or invalid: {}", p);
-                                            all_valid = false;
-                                            break;
-                                        }
-                                    }
+                                    valid_paths.push(p.clone());
                                 }
 
                                 if all_valid && !valid_paths.is_empty() {
@@ -523,15 +523,23 @@ async fn process_chat_file(
                                     }
 
                                     // Set flag to reprocess (re-read file) and break inner loop
-                                    is_file_request = true;
-                                    needs_reprocess = true;
+                                    true
+                                } else {
+                                    false
                                 }
+                            } else {
+                                false
                             }
+                        } else {
+                            false
                         }
-                    }
+                    } else {
+                        false
+                    };
 
                     // If it was a valid file request, break inner loop to allow outer loop to re-read
                     if is_file_request {
+                        needs_reprocess = true;
                         break;
                     }
 
@@ -638,30 +646,21 @@ fn expand_placeholders(text: &str) -> io::Result<String> {
     let mut result = String::new();
     let mut last_end = 0;
 
+    let cwd = env::current_dir()?;
+
     for cap in re.captures_iter(text) {
         let match_range = cap.get(0).unwrap();
-        let placeholder = match_range.as_str();
         let match_start = match_range.start();
         result.push_str(&text[last_end..match_start]);
 
         if let Some(file_path) = cap.get(1) {
             let path_str = file_path.as_str();
-            match expand_file_path(path_str) {
-                Ok(expanded) => result.push_str(&expanded),
-                Err(e) => {
-                    println!("Warning: Failed to expand file placeholder '{}' : {} (path: {})", placeholder, e, path_str);
-                    result.push_str(placeholder);
-                }
-            }
+            let expanded = expand_file_path(path_str, &cwd);
+            result.push_str(&expanded);
         } else if let Some(dir_path) = cap.get(2) {
             let path_str = dir_path.as_str();
-            match expand_dir_tree(path_str) {
-                Ok(expanded) => result.push_str(&expanded),
-                Err(e) => {
-                    println!("Warning: Failed to expand directory placeholder '{}' : {} (path: {})", placeholder, e, path_str);
-                    result.push_str(placeholder);
-                }
-            }
+            let expanded = expand_dir_tree(path_str, &cwd);
+            result.push_str(&expanded);
         }
 
         last_end = match_range.end();
@@ -671,84 +670,137 @@ fn expand_placeholders(text: &str) -> io::Result<String> {
     Ok(result)
 }
 
-fn expand_file_path(path_str: &str) -> io::Result<String> {
+fn expand_file_path(path_str: &str, cwd: &Path) -> String {
     let path = Path::new(path_str);
     let mut output = String::new();
 
     if path_str.contains('*') || path_str.contains('?') {
         // Glob
-        let mut files: Vec<_> = glob(path_str)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?
-            .filter_map(|res| res.ok().filter(|p| p.is_file()))
-            .collect();
-        if files.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "No files matched the pattern"));
-        }
-        files.sort();
-        for p in files {
-            let content = fs::read_to_string(&p)?;
-            writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", p.display(), content).expect("Failed to write to String");
+        match glob(path_str) {
+            Ok(iter) => {
+                let mut files: Vec<_> = iter.filter_map(|res| res.ok()).filter(|p| p.is_file()).collect();
+                if files.is_empty() {
+                    return format!("No files matched the pattern {}.\n", path_str);
+                }
+                files.sort();
+                for p in files {
+                    match p.canonicalize() {
+                        Ok(canon) if canon.starts_with(cwd) => {
+                            match fs::read_to_string(&p) {
+                                Ok(content) => {
+                                    let _ = writeln!(output, "Contents of {}:\n```\n{}\n```\n", p.display(), content);
+                                }
+                                Err(e) => {
+                                    let _ = writeln!(output, "Failed to read file {}: {}.\n", p.display(), e);
+                                }
+                            }
+                        }
+                        _ => {
+                            let _ = writeln!(output, "The requested file {} is unavailable (outside project or invalid).\n", p.display());
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                return format!("Invalid glob pattern {}: {}.\n", path_str, e);
+            }
         }
     } else if path.is_dir() {
         // Directory recurse
         if !path.exists() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "Directory not found"));
+            return format!("The requested directory {} does not exist.\n", path_str);
         }
-        let mut entries: Vec<_> = WalkDir::new(path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).collect();
-        if entries.is_empty() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "No files found in directory"));
+        if !path.is_dir() {
+            return format!("The path {} is not a directory.\n", path_str);
         }
-        entries.sort_by_key(|e| e.path().to_owned());
-        for entry in entries {
-            let entry_path = entry.path();
-            if !entry_path.exists() {
-                return Err(io::Error::new(io::ErrorKind::NotFound, format!("File not found in directory: {}", entry_path.display())));
+        match path.canonicalize() {
+            Ok(canon) if canon.starts_with(cwd) => {
+                let mut entries: Vec<_> = WalkDir::new(path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).collect();
+                if entries.is_empty() {
+                    let _ = writeln!(output, "No files found in directory {}.\n", path.display());
+                } else {
+                    entries.sort_by_key(|e| e.path().to_owned());
+                    for entry in entries {
+                        let ep = entry.path();
+                        match ep.canonicalize() {
+                            Ok(canon) if canon.starts_with(cwd) => {
+                                match fs::read_to_string(ep) {
+                                    Ok(content) => {
+                                        let _ = writeln!(output, "Contents of {}:\n```\n{}\n```\n", ep.display(), content);
+                                    }
+                                    Err(e) => {
+                                        let _ = writeln!(output, "Failed to read file {}: {}.\n", ep.display(), e);
+                                    }
+                                }
+                            }
+                            _ => {
+                                let _ = writeln!(output, "The requested file {} is unavailable.\n", ep.display());
+                            }
+                        }
+                    }
+                }
             }
-            let content = fs::read_to_string(entry_path)?;
-            writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", entry_path.display(), content).expect("Failed to write to String");
+            _ => {
+                return format!("The requested directory {} is unavailable (outside project or invalid).\n", path_str);
+            }
         }
     } else {
         // Single file
-        if !path.exists() {
-            return Err(io::Error::new(io::ErrorKind::NotFound, "File not found"));
-        }
-        if !path.is_file() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Path is not a file"));
-        }
-        let content = fs::read_to_string(path)?;
-        writeln!(&mut output, "Contents of {}:\n```\n{}\n```\n", path.display(), content).expect("Failed to write to String");
-    }
-
-    Ok(output)
-}
-
-fn expand_dir_tree(path_str: &str) -> io::Result<String> {
-    let path = Path::new(path_str);
-    if !path.exists() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "Directory not found"));
-    }
-    if !path.is_dir() {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Path is not a directory"));
-    }
-
-    let mut output = format!("Contents of directory {}:\n```\n", path.display());
-    let mut entries: Vec<_> = WalkDir::new(path).min_depth(1).into_iter().filter_map(|e| e.ok()).collect();
-    if entries.is_empty() {
-        output.push_str("(empty directory)\n");
-    } else {
-        entries.sort_by_key(|e| e.path().to_owned());
-        for entry in entries {
-            let rel_path = entry.path().strip_prefix(path).unwrap();
-            let indent = "  ".repeat(entry.depth() - 1);
-            if entry.file_type().is_dir() {
-                writeln!(&mut output, "{}{}/", indent, rel_path.display()).expect("Failed to write to String");
-            } else {
-                writeln!(&mut output, "{}{}", indent, rel_path.display()).expect("Failed to write to String");
+        match path.canonicalize() {
+            Ok(canon) if canon.starts_with(cwd) => {
+                match fs::read_to_string(path) {
+                    Ok(content) => {
+                        let _ = writeln!(output, "Contents of {}:\n```\n{}\n```\n", path.display(), content);
+                    }
+                    Err(e) => {
+                        let _ = writeln!(output, "Failed to read file {}: {}.\n", path.display(), e);
+                    }
+                }
+            }
+            _ => {
+                // Covers not found, outside project, etc.
+                return format!("The requested file {} does not exist or is unavailable.\n", path_str);
             }
         }
     }
-    output.push_str("```\n");
-    Ok(output)
+
+    output
+}
+
+fn expand_dir_tree(path_str: &str, cwd: &Path) -> String {
+    let path = Path::new(path_str);
+    if !path.exists() {
+        return format!("The requested directory {} does not exist.\n", path_str);
+    }
+    if !path.is_dir() {
+        return format!("The path {} is not a directory.\n", path_str);
+    }
+
+    match path.canonicalize() {
+        Ok(canon) if canon.starts_with(cwd) => {
+            let mut output = format!("Contents of directory {}:\n```\n", path.display());
+            let mut entries: Vec<_> = WalkDir::new(path).min_depth(1).into_iter().filter_map(|e| e.ok()).collect();
+            if entries.is_empty() {
+                output.push_str("(empty directory)\n");
+            } else {
+                entries.sort_by_key(|e| e.path().to_owned());
+                for entry in entries {
+                    let rel_path = entry.path().strip_prefix(path).unwrap();
+                    let indent = "  ".repeat(entry.depth() - 1);
+                    if entry.file_type().is_dir() {
+                        let _ = writeln!(output, "{}{}/", indent, rel_path.display());
+                    } else {
+                        let _ = writeln!(output, "{}{}", indent, rel_path.display());
+                    }
+                }
+            }
+            output.push_str("```\n");
+            output
+        }
+        _ => {
+            format!("The requested directory {} is unavailable (outside project or invalid).\n", path_str)
+        }
+    }
 }
 
 // Play a pleasant chime sound from bundled MP3
