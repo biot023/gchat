@@ -122,7 +122,7 @@ async fn main() -> io::Result<()> {
         .arg(
             Arg::new("max_tokens")
                 .short('t')
-                .long("max-tokens")
+                .long("max_tokens")
                 .value_name("LEVEL")
                 .help("Default max tokens level"),
         )
@@ -430,17 +430,25 @@ async fn process_chat_file(
 
         // Expand other placeholders ONLY in user messages (prompts to the API)
         let mut any_expansion_error = false;
+        let mut all_failed_paths = Vec::new(); // New: Collect all failed paths across messages
         for msg in messages.iter_mut() {
             if msg.role == "user" {
-                let (expanded, had_error) = expand_placeholders(&msg.content)?;
+                let (expanded, had_error, failed_paths) = expand_placeholders(&msg.content)?;
                 msg.content = expanded;
                 any_expansion_error |= had_error;
+                all_failed_paths.extend(failed_paths);
             }
         }
 
-        // If there were any expansion errors, play warning sound and notify user
+        // If there were any expansion errors, play warning sound and notify user with failed paths
         if any_expansion_error {
-            println!("Warning: Issues encountered while expanding placeholders (e.g., file not found or invalid path). Details are included in the prompt sent to Grok. Check debug logs for full expanded content.");
+            println!("Warning: Issues encountered while expanding placeholders. Details are included in the prompt sent to Grok.");
+            if !all_failed_paths.is_empty() {
+                println!("Failed to expand placeholders for files/directories:");
+                for path in &all_failed_paths {
+                    println!("  {}", path);
+                }
+            }
             play_warning();
         }
 
@@ -654,11 +662,12 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
     messages
 }
 
-fn expand_placeholders(text: &str) -> io::Result<(String, bool)> {
+fn expand_placeholders(text: &str) -> io::Result<(String, bool, Vec<String>)> {
     let re = Regex::new(r"@f\s*:(\S+)|@d\s*:(\S+)").unwrap();
     let mut result = String::new();
     let mut last_end = 0;
     let mut had_error = false;
+    let mut failed_paths = Vec::new(); // New: Collect failed paths here
 
     let cwd = env::current_dir()?;
 
@@ -669,27 +678,30 @@ fn expand_placeholders(text: &str) -> io::Result<(String, bool)> {
 
         if let Some(file_path) = cap.get(1) {
             let path_str = file_path.as_str();
-            let (expanded, err) = expand_file_path(path_str, &cwd);
+            let (expanded, err, failed_for_this) = expand_file_path(path_str, &cwd); // Updated signature
             result.push_str(&expanded);
             had_error |= err;
+            failed_paths.extend(failed_for_this); // Add to overall list
         } else if let Some(dir_path) = cap.get(2) {
             let path_str = dir_path.as_str();
-            let (expanded, err) = expand_dir_tree(path_str, &cwd);
+            let (expanded, err, failed_for_this) = expand_dir_tree(path_str, &cwd); // Updated signature
             result.push_str(&expanded);
             had_error |= err;
+            failed_paths.extend(failed_for_this); // Add to overall list
         }
 
         last_end = match_range.end();
     }
 
     result.push_str(&text[last_end..]);
-    Ok((result, had_error))
+    Ok((result, had_error, failed_paths))
 }
 
-fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool) {
+fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
     let path = Path::new(path_str);
     let mut output = String::new();
     let mut had_error = false;
+    let mut failed_paths = Vec::new(); // New: Collect failed paths for this expansion
 
     if path_str.contains('*') || path_str.contains('?') {
         // Glob
@@ -698,32 +710,36 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool) {
                 let mut files: Vec<_> = iter.filter_map(|res| res.ok()).filter(|p| p.is_file()).collect();
                 if files.is_empty() {
                     had_error = true;
+                    failed_paths.push(path_str.to_string()); // Add failed glob pattern
                     let _ = writeln!(output, "No files matched the pattern {}.\n", path_str);
-                    return (output, had_error);
-                }
-                files.sort();
-                for p in files {
-                    match p.canonicalize() {
-                        Ok(canon) if canon.starts_with(cwd) => {
-                            match fs::read_to_string(&p) {
-                                Ok(content) => {
-                                    let _ = writeln!(output, "Contents of {}:\n```\n{}\n```\n", p.display(), content);
-                                }
-                                Err(e) => {
-                                    had_error = true;
-                                    let _ = writeln!(output, "Failed to read file {}: {}.\n", p.display(), e);
+                } else {
+                    files.sort();
+                    for p in files {
+                        match p.canonicalize() {
+                            Ok(canon) if canon.starts_with(cwd) => {
+                                match fs::read_to_string(&p) {
+                                    Ok(content) => {
+                                        let _ = writeln!(output, "Contents of {}:\n```\n{}\n```\n", p.display(), content);
+                                    }
+                                    Err(e) => {
+                                        had_error = true;
+                                        failed_paths.push(p.display().to_string()); // Add failed file
+                                        let _ = writeln!(output, "Failed to read file {}: {}.\n", p.display(), e);
+                                    }
                                 }
                             }
-                        }
-                        _ => {
-                            had_error = true;
-                            let _ = writeln!(output, "The requested file {} is unavailable (outside project or invalid).\n", p.display());
+                            _ => {
+                                had_error = true;
+                                failed_paths.push(p.display().to_string()); // Add invalid/outside file
+                                let _ = writeln!(output, "The requested file {} is unavailable (outside project or invalid).\n", p.display());
+                            }
                         }
                     }
                 }
             }
             Err(e) => {
                 had_error = true;
+                failed_paths.push(path_str.to_string()); // Add invalid glob pattern
                 let _ = writeln!(output, "Invalid glob pattern {}: {}.\n", path_str, e);
             }
         }
@@ -731,47 +747,50 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool) {
         // Directory recurse
         if !path.exists() {
             had_error = true;
+            failed_paths.push(path_str.to_string()); // Add non-existent directory
             let _ = writeln!(output, "The requested directory {} does not exist.\n", path_str);
-            return (output, had_error);
-        }
-        if !path.is_dir() {
+        } else if !path.is_dir() {
             had_error = true;
+            failed_paths.push(path_str.to_string()); // Add invalid (not a dir)
             let _ = writeln!(output, "The path {} is not a directory.\n", path_str);
-            return (output, had_error);
-        }
-        match path.canonicalize() {
-            Ok(canon) if canon.starts_with(cwd) => {
-                let mut entries: Vec<_> = WalkDir::new(path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).collect();
-                if entries.is_empty() {
-                    let _ = writeln!(output, "No files found in directory {}.\n", path.display());
-                    // Note: Not considering empty dir as error
-                } else {
-                    entries.sort_by_key(|e| e.path().to_owned());
-                    for entry in entries {
-                        let ep = entry.path();
-                        match ep.canonicalize() {
-                            Ok(canon) if canon.starts_with(cwd) => {
-                                match fs::read_to_string(ep) {
-                                    Ok(content) => {
-                                        let _ = writeln!(output, "Contents of {}:\n```\n{}\n```\n", ep.display(), content);
-                                    }
-                                    Err(e) => {
-                                        had_error = true;
-                                        let _ = writeln!(output, "Failed to read file {}: {}.\n", ep.display(), e);
+        } else {
+            match path.canonicalize() {
+                Ok(canon) if canon.starts_with(cwd) => {
+                    let mut entries: Vec<_> = WalkDir::new(path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).collect();
+                    if entries.is_empty() {
+                        let _ = writeln!(output, "No files found in directory {}.\n", path.display());
+                        // Note: Not considering empty dir as error
+                    } else {
+                        entries.sort_by_key(|e| e.path().to_owned());
+                        for entry in entries {
+                            let ep = entry.path();
+                            match ep.canonicalize() {
+                                Ok(canon) if canon.starts_with(cwd) => {
+                                    match fs::read_to_string(ep) {
+                                        Ok(content) => {
+                                            let _ = writeln!(output, "Contents of {}:\n```\n{}\n```\n", ep.display(), content);
+                                        }
+                                        Err(e) => {
+                                            had_error = true;
+                                            failed_paths.push(ep.display().to_string()); // Add failed file in dir
+                                            let _ = writeln!(output, "Failed to read file {}: {}.\n", ep.display(), e);
+                                        }
                                     }
                                 }
-                            }
-                            _ => {
-                                had_error = true;
-                                let _ = writeln!(output, "The requested file {} is unavailable.\n", ep.display());
+                                _ => {
+                                    had_error = true;
+                                    failed_paths.push(ep.display().to_string()); // Add invalid file in dir
+                                    let _ = writeln!(output, "The requested file {} is unavailable.\n", ep.display());
+                                }
                             }
                         }
                     }
                 }
-            }
-            _ => {
-                had_error = true;
-                let _ = writeln!(output, "The requested directory {} is unavailable (outside project or invalid).\n", path_str);
+                _ => {
+                    had_error = true;
+                    failed_paths.push(path_str.to_string()); // Add invalid/outside directory
+                    let _ = writeln!(output, "The requested directory {} is unavailable (outside project or invalid).\n", path_str);
+                }
             }
         }
     } else {
@@ -784,6 +803,7 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool) {
                     }
                     Err(e) => {
                         had_error = true;
+                        failed_paths.push(path_str.to_string()); // Add failed single file
                         let _ = writeln!(output, "Failed to read file {}: {}.\n", path.display(), e);
                     }
                 }
@@ -791,25 +811,29 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool) {
             _ => {
                 // Covers not found, outside project, etc.
                 had_error = true;
+                failed_paths.push(path_str.to_string()); // Add missing/invalid single file
                 let _ = writeln!(output, "The requested file {} does not exist or is unavailable.\n", path_str);
             }
         }
     }
 
-    (output, had_error)
+    (output, had_error, failed_paths)
 }
 
-fn expand_dir_tree(path_str: &str, cwd: &Path) -> (String, bool) {
+fn expand_dir_tree(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
     let path = Path::new(path_str);
     let mut had_error = false;
+    let mut failed_paths = Vec::new(); // New: Collect failed paths for this expansion
 
     if !path.exists() {
         had_error = true;
-        return (format!("The requested directory {} does not exist.\n", path_str), had_error);
+        failed_paths.push(path_str.to_string()); // Add non-existent directory
+        return (format!("The requested directory {} does not exist.\n", path_str), had_error, failed_paths);
     }
     if !path.is_dir() {
         had_error = true;
-        return (format!("The path {} is not a directory.\n", path_str), had_error);
+        failed_paths.push(path_str.to_string()); // Add invalid (not a dir)
+        return (format!("The path {} is not a directory.\n", path_str), had_error, failed_paths);
     }
 
     match path.canonicalize() {
@@ -832,11 +856,12 @@ fn expand_dir_tree(path_str: &str, cwd: &Path) -> (String, bool) {
                 }
             }
             output.push_str("```\n");
-            (output, had_error)
+            (output, had_error, failed_paths) // No failures for tree expansion itself, only initial checks
         }
         _ => {
             had_error = true;
-            (format!("The requested directory {} is unavailable (outside project or invalid).\n", path_str), had_error)
+            failed_paths.push(path_str.to_string()); // Add invalid/outside directory
+            (format!("The requested directory {} is unavailable (outside project or invalid).\n", path_str), had_error, failed_paths)
         }
     }
 }
