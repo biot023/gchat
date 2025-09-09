@@ -23,13 +23,8 @@ const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
 const MAX_LEVEL: u32 = 7;
 
-// const SYSTEM_INSTRUCTIONS: &str = r#"
-// You are Grok, a helpful AI. If you need the contents of files to better answer the user's query, you can request them by responding with EXACTLY this format and NOTHING ELSE:
-// GROK REQUESTS FILES: relative/path1, relative/path2
-// Paths must be relative to the current working directory (e.g., src/main.rs, not /absolute/path or ../outside). Do not request files outside the project directory. You can request multiple files, directories, or globs (e.g., src/*.rs). The system will automatically include their contents in the next user message. Request all needed files at once if possible. You may request again if more are needed after seeing the contents.
-// "#;
 const SYSTEM_INSTRUCTIONS: &str = r#"
-You are Grok, a helpful AI. **To provide the most accurate and helpful responses, actively request the contents of relevant files whenever you need them to verify assumptions, check details, or gather more context—even if the user hasn't explicitly asked. For example, if a query involves code, configurations, or project structure, request the necessary files proactively.**
+You are Grok, a helpful AI and coding assistant. **To provide the most accurate and helpful responses, actively request the contents of relevant files whenever you need them to verify assumptions, check details, or gather more context—even if the user hasn't explicitly asked. For example, if a query involves code, configurations, or project structure, request the necessary files proactively.**
 
 If you decide to request files, respond with **EXACTLY** this format and **NOTHING ELSE**:
 GROK REQUESTS FILES: relative/path1, relative/path2
@@ -41,7 +36,7 @@ Paths must be relative to the current working directory (e.g., src/main.rs, not 
 const DEFAULT_CHAT_FILE: &str = "./gchat.md";
 const DEFAULT_MAX_TOKENS: &str = "L3";
 const DEFAULT_TEMPERATURE: &str = "1.0";
-const DEFAULT_MODEL: &str = "grok-4";
+const DEFAULT_MODEL: &str = "grok-code-fast-1";
 const DEFAULT_API_TIMEOUT: &str = "600";
 const DEFAULT_AUTO_REQUEST_FILES: bool = false;
 const DEFAULT_AUTO_INCREASE_MAX_TOKENS: bool = false;
@@ -446,7 +441,7 @@ async fn process_chat_file(
         // If there were any expansion errors, play warning sound and notify user
         if any_expansion_error {
             println!("Warning: Issues encountered while expanding placeholders (e.g., file not found or invalid path). Details are included in the prompt sent to Grok. Check debug logs for full expanded content.");
-            play_warning().await;
+            play_warning();
         }
 
         // Log the expanded messages (DEBUG level)
@@ -493,7 +488,7 @@ async fn process_chat_file(
                 .json(&req);
 
             // Play thinking sound
-            play_thinking().await;
+            play_thinking();
 
             // Print thinking message with settings
             println!("Grok is thinking... (max_tokens: {}, temperature: {})", req.max_tokens, local_temperature);
@@ -590,7 +585,7 @@ async fn process_chat_file(
                     }
 
                     // Play chime sound
-                    play_chime().await;
+                    play_chime();
 
                     // Break inner loop after handling final response
                     break;
@@ -599,12 +594,12 @@ async fn process_chat_file(
                     let status = resp.status();
                     let err_body = resp.text().await.unwrap_or_default();
                     println!("Grok failed to respond.");
-                    play_warning().await;
+                    play_warning();
                     return Err(io::Error::new(io::ErrorKind::Other, format!("API error: {} - Body: {}", status, err_body)));
                 }
                 Err(e) => {
                     println!("Grok failed to respond.");
-                    play_warning().await;
+                    play_warning();
                     return Err(io::Error::new(io::ErrorKind::Other, format!("Request error: {:?}", e)));
                 },
             }
@@ -846,58 +841,63 @@ fn expand_dir_tree(path_str: &str, cwd: &Path) -> (String, bool) {
     }
 }
 
-// Play a thinking sound from bundled MP3
-async fn play_thinking() {
-    tokio::task::spawn_blocking(|| {
-        let (_stream, stream_handle) = OutputStream::try_default().expect("Failed to get default output stream");
-        let sink = Sink::try_new(&stream_handle).expect("Failed to create sink");
-
-        // Bundle the MP3 file into the binary
-        let bytes = include_bytes!("../media/thinking.mp3");
-        let cursor = Cursor::new(bytes.as_ref());
-        let source = Decoder::new(cursor).expect("Failed to decode MP3");
-
-        sink.append(source);
-        sink.sleep_until_end(); // Wait for playback to finish
-    })
-    .await
-    .expect("Failed to play thinking sound");
-}
-
-// Play a pleasant chime sound from bundled MP3
-async fn play_chime() {
-    tokio::task::spawn_blocking(|| {
-        let (_stream, stream_handle) = OutputStream::try_default().expect("Failed to get default output stream");
-        let sink = Sink::try_new(&stream_handle).expect("Failed to create sink");
-
-        // Bundle the MP3 file into the binary
-        let bytes = include_bytes!("../media/chime.mp3");
-        let cursor = Cursor::new(bytes.as_ref());
-        let source = Decoder::new(cursor).expect("Failed to decode MP3");
-
-        sink.append(source);
-        sink.sleep_until_end(); // Wait for playback to finish
-    })
-    .await
-    .expect("Failed to play chime");
-}
-
-// Play a warning sound (descending tones)
-async fn play_warning() {
-    tokio::task::spawn_blocking(|| {
-        let (_stream, stream_handle) = OutputStream::try_default().expect("Failed to get default output stream");
-        let sink = Sink::try_new(&stream_handle).expect("Failed to create sink");
-
-        // Warning: three descending sine waves (e.g., 659Hz, 523Hz, 440Hz for E5, C5, A4 notes)
-        let frequencies = [659, 523, 440];
-        for freq in frequencies {
-            let source = SineWave::new(freq as f32).take_duration(StdDuration::from_millis(200)).amplify(0.20); // Short, soft tone
+// Play thinking sound (non-blocking, errors logged)
+fn play_thinking() {
+    tokio::spawn(async {
+        if let Err(e) = tokio::task::spawn_blocking(|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let (_stream, stream_handle) = OutputStream::try_default().map_err(|e| format!("Failed to get default output stream: {}", e))?;
+            let sink = Sink::try_new(&stream_handle).map_err(|e| format!("Failed to create sink: {}", e))?;
+            
+            let bytes = include_bytes!("../media/thinking.mp3");
+            let cursor = Cursor::new(bytes.as_ref());
+            let source = Decoder::new(cursor).map_err(|e| format!("Failed to decode MP3: {}", e))?;
+            
             sink.append(source);
-            std::thread::sleep(StdDuration::from_millis(50)); // Small gap between tones
+            sink.sleep_until_end();
+            Ok(())
+        }).await {
+            log::error!("Failed to spawn or complete thinking sound playback: {}", e);
         }
+    });
+}
 
-        sink.sleep_until_end(); // Wait for playback to finish
-    })
-    .await
-    .expect("Failed to play warning");
+// Play chime sound (non-blocking, errors logged)
+fn play_chime() {
+    tokio::spawn(async {
+        if let Err(e) = tokio::task::spawn_blocking(|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let (_stream, stream_handle) = OutputStream::try_default().map_err(|e| format!("Failed to get default output stream: {}", e))?;
+            let sink = Sink::try_new(&stream_handle).map_err(|e| format!("Failed to create sink: {}", e))?;
+            
+            let bytes = include_bytes!("../media/chime.mp3");
+            let cursor = Cursor::new(bytes.as_ref());
+            let source = Decoder::new(cursor).map_err(|e| format!("Failed to decode MP3: {}", e))?;
+            
+            sink.append(source);
+            sink.sleep_until_end();
+            Ok(())
+        }).await {
+            log::error!("Failed to spawn or complete chime sound playback: {}", e);
+        }
+    });
+}
+
+// Play warning sound (non-blocking, errors logged)
+fn play_warning() {
+    tokio::spawn(async {
+        if let Err(e) = tokio::task::spawn_blocking(|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            let (_stream, stream_handle) = OutputStream::try_default().map_err(|e| format!("Failed to get default output stream: {}", e))?;
+            let sink = Sink::try_new(&stream_handle).map_err(|e| format!("Failed to create sink: {}", e))?;
+            
+            let frequencies = [659, 523, 440];
+            for freq in frequencies {
+                let source = SineWave::new(freq as f32).take_duration(StdDuration::from_millis(200)).amplify(0.20);
+                sink.append(source);
+                std::thread::sleep(StdDuration::from_millis(50));
+            }
+            sink.sleep_until_end();
+            Ok(())
+        }).await {
+            log::error!("Failed to spawn or complete warning sound playback: {}", e);
+        }
+    });
 }
