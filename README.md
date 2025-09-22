@@ -24,7 +24,7 @@ Like I say, it's working for me. :)
 
 A Rust utility that enables interactive conversations with the Grok API (from xAI) by monitoring a Markdown chat file. The app polls the file every 1 second for changes. When it detects a new user prompt (marked by "USER PROMPT:"), it sends the full conversation history to the Grok API, appends the response (marked by "GROK RESPONSE:"), and adds a new "USER PROMPT:" section for your next input. It plays a pleasant chime sound on successful responses and a warning sound on errors.
 
-This tool is ideal for users who prefer editing a file in their favorite text editor (e.g., VS Code, Vim) rather than using a web interface or CLI prompt. It supports placeholders for including file contents, directory listings, per-prompt token limits, and temperature settings.
+This tool is ideal for users who prefer editing a file in their favorite text editor (e.g., VS Code, Vim) rather than using a web interface or CLI prompt. It supports placeholders for including file contents, directory listings, per-prompt token limits, and temperature settings. Additionally, Grok can safely run ripgrep (rg) searches or fd-find (fd) commands on the project to gather context.
 
 ## Features
 - **File Watching**: Polls the chat file (default: `./gchat.md`) every 1 second. Processes changes automatically.
@@ -40,6 +40,8 @@ This tool is ideal for users who prefer editing a file in their favorite text ed
 - **Initial Processing**: On startup, processes any pending user prompt in the file.
 - **Auto File Requests**: Optional feature (enabled with `--auto-request-files` or `-a`). Allows Grok to request files from your project directory if needed to answer queries. Grok responds in a specific format ("GROK REQUESTS FILES: relative/path1, relative/path2"), and the utility automatically appends placeholders (e.g., `@f:src/main.rs`) to the last user prompt, then re-queries the API with the contents included. This chains until a normal response is received. Paths are validated to stay within the project directory (no absolute paths or parent traversal). Supports globs and directories if requested.
 - **Auto-Increase Max Tokens**: Optional feature (enabled with `--auto-increase-max-tokens` or `-i`). Automatically retries truncated responses with incrementally higher `max_tokens` levels (up to L7) until non-truncated or max is reached.
+- **Safe Ripgrep (RG) Commands**: Optional feature (enabled with `--allow-rg-commands` or `-r`). Allows Grok to run safe ripgrep searches on the project for grep-like context. Grok responds with "GROK RUNS RG: rg <safe-args>", e.g., "GROK RUNS RG: rg -i 'fn main' --glob '**/*.rs' --line-number". The utility validates, executes in the project root, appends output to the chat file, and chains. Uses a whitelist of flags; forbids dangerous ones.
+- **Safe fd-find (FD) Commands**: Optional feature (enabled with `--allow-fd-commands` or `-d`). Allows Grok to run safe fd searches for file/directory discovery. Grok responds with "GROK RUNS FD: fd <safe-args>", e.g., "GROK RUNS FD: fd --type f --glob '*.md'". The utility validates, executes, appends output, and chains similarly to RG.
 
 ## Installation
 
@@ -47,6 +49,7 @@ This tool is ideal for users who prefer editing a file in their favorite text ed
 - **Rust**: Install from [rustup.rs](https://rustup.rs/). Requires Rust 1.70+.
 - **Audio Dependencies** (for sounds): On Linux, install `libasound2-dev` and `pkg-config` (e.g., `sudo apt install libasound2-dev pkg-config`). On macOS/Windows, it should work out-of-the-box with `rodio`.
 - **Grok API Key**: Sign up at [x.ai](https://x.ai) and get your API key.
+- **Optional Tools**: For full functionality, install `ripgrep` (rg) and `fd-find` (fd) if you plan to use RG/FD commands (check your package manager).
 
 ### Building the Project
 1. Clone the repository:
@@ -72,6 +75,7 @@ The project uses:
 - `reqwest` and `tokio` for async API calls.
 - `serde` for JSON handling.
 - `regex` and `walkdir`/`glob` for placeholder expansion.
+- `shell-words` for safe command parsing.
 - `rodio` for audio feedback.
 - `log` and `env_logger` for logging.
 
@@ -94,7 +98,19 @@ All are pulled in via `Cargo.toml` during build.
    export RUST_LOG=debug
    ```
 
-3. **Run the App**:
+3. **Optional: Customize Defaults**:
+   Create or edit `~/.config/gchat/config.toml` to override defaults without CLI flags. Example:
+   ```
+   chat_file = "./my-chat.md"
+   max_tokens = "L4"
+   temperature = 0.8
+   auto_request_files = true
+   auto_increase_max_tokens = true
+   allow_rg_commands = true
+   allow_fd_commands = true
+   ```
+
+4. **Run the App**:
    ```
    cargo run -- [options]
    ```
@@ -105,16 +121,18 @@ All are pulled in via `Cargo.toml` during build.
 ### Command-Line Options
 Use `cargo run -- --help` for full details. Key options:
 - `-f, --chat-file <PATH>`: Path to the chat file (default: `./gchat.md`).
-- `-t, --max-tokens <LEVEL>`: Default max tokens level (default: `L3` for 4096 tokens). Can be overridden per-prompt with `@t`. See "Token Levels" below for details.
+- `-t, --max_tokens <LEVEL>`: Default max tokens level (default: `L3` for 4096 tokens). Can be overridden per-prompt with `@t`. See "Token Levels" below for details.
 - `-p, --temperature <FLOAT>`: Default temperature (default: 1.0). Can be overridden per-prompt with `@p`.
-- `-m, --model <STRING>`: The Grok model to call (default: `grok-4`).
+- `-m, --model <STRING>`: The Grok model to call (default: `grok-code-fast-1`).
 - `-T, --api-timeout <SECONDS>`: API request timeout (default: 600 seconds).
 - `-a, --auto-request-files`: Enable Grok to automatically request and include project files if needed (default: false). See "Auto File Requests" below for details.
 - `-i, --auto-increase-max-tokens`: Automatically increase max_tokens level on truncation (up to L7) by re-querying (default: false). See "Auto-Increase Max Tokens" below for details.
+- `-r, --allow-rg-commands`: Allow Grok to run safe ripgrep commands on the project (default: false). See "RG Commands" below for details.
+- `-d, --allow-fd-commands`: Allow Grok to run safe fd commands on the project (default: false). See "FD Commands" below for details.
 
 Example:
 ```
-cargo run -- -f mychat.md -t L3 -p 0.8 -m grok-4 -T 300 -a -i
+cargo run -- -f mychat.md -t L3 -p 0.8 -m grok-code-fast-1 -T 300 -a -i -r -d
 ```
 
 ### Basic Workflow
@@ -179,9 +197,8 @@ The `--max-tokens` option and `@t` placeholder use "L" levels to specify `max_to
 - **L6**: 32768 tokens
 - **L7**: 65536 tokens (maximum; higher levels are capped at L7)
 
-
 ### Auto File Requests
-Enabled with `--auto-request-files` (or `-a`). This allows Grok to request files from your project directory (current working directory) if it needs them to answer a query better.
+Enabled with `--auto-request-files` (or `-a`). This allows Grok to request files from your project directory (current working directory) if it needs them to answer queries better.
 
 - Grok must respond with **exactly** "GROK REQUESTS FILES: relative/path1, relative/path2" (and nothing else).
 - Paths must be relative (e.g., `src/main.rs`, not `/absolute/path` or `../outside`). Supports multiple paths, directories, or globs (e.g., `src/*.rs`).
@@ -200,20 +217,51 @@ Example:
 - Grok requests: GROK REQUESTS FILES: src/main.rs
 - App appends to prompt and re-queries with file contents included.
 
+### RG Commands
+Enabled with `--allow-rg-commands` (or `-r`). This allows Grok to run safe ripgrep (rg) commands on the project for grep-like searches.
+
+- Grok must respond with **exactly** "GROK RUNS RG: rg <safe-args>" (and nothing else).
+- Commands must start with `rg ` and use only whitelisted flags (e.g., `-i`, `-n`, `--glob`, `--before-context`).
+- Forbidden: Shell metachars (`|`, `>`, `&`, etc.), absolute paths, traversal (`../`).
+- The utility parses, runs in the project root, captures output (limited to 50KB), and appends it to the chat file like:
+  ```
+  \n\nGROK RAN RG: command\n```\noutput\n```\n
+  ```
+- Then chains to re-query with the appended output.
+- Security: Whitelist prevents execution risks. Disabled by default. Requires `ripgrep` installed.
+
+Example:
+- Grok request: GROK RUNS RG: rg -i "fn main" --glob "**/*.rs" --line-number
+- Output appended and re-queried.
+
+### FD Commands
+Enabled with `--allow-fd-commands` (or `-d`). This allows Grok to run safe fd-find (fd) commands on the project for file/directory searches.
+
+- Grok must respond with **exactly** "GROK RUNS FD: fd <safe-args>" (and nothing else).
+- Commands must start with `fd ` and use only whitelisted flags (e.g., `--type`, `--glob`, `--max-depth`).
+- Forbidden: Shell metachars, absolute paths, traversal.
+- Utility parses, runs, appends output (e.g., "GROK RAN FD: command\n```\noutput\n```\n"), and chains.
+- Useful for locating files by type/name. Disabled by default. Requires `fd-find` installed.
+
+Example:
+- Grok request: GROK RUNS FD: fd --type f --glob "*.md"
+- Finds all Markdown files.
+
 ### Auto-Increase Max Tokens
 Enabled with `--auto-increase-max-tokens` (or `-i`). When a response is truncated (finish_reason: "max_tokens" or "length"), the utility automatically increments the max_tokens level (from the current prompt's level or default) and re-queries with the same messages but higher max_tokens (e.g., from L3 to L4). This chains until a non-truncated response or L7 is reached. If still truncated at L7, appends with a warning.
 
 Retries are handled in-memory (no file changes until final response). Console shows retry attempts (e.g., "Response truncated. Retrying with L4 (8192 tokens)").
 
-This feature works independently but can chain with auto file requests.
+This feature works independently but can chain with auto file requests, RG, or FD.
 
 ## Notes
 - **Polling**: Checks every 1 second; includes a 500ms debounce after detection to handle file saves.
 - **File Format**: Must use exact markers ("USER PROMPT:" and "GROK RESPONSE:") on their own lines. Content follows until the next marker.
-- **API Model**: Defaults to "grok-4" with temperature=1.0; customizable.
+- **API Model**: Defaults to "grok-code-fast-1" with temperature=1.0; customizable.
 - **Errors**: API failures (e.g., invalid key, timeouts) print to console and play a warning sound. Check logs for details.
 - **Sounds**: Bundled MP3 chime for success; generated descending tones for warnings. Disable by removing `rodio` calls if desired.
 - **Limitations**: No multi-user support; single-threaded polling. API rate limits/costs apply (check xAI docs).
+- **Security**: File requests, RG, and FD are restricted to the project root and use whitelists to prevent unsafe operations. Enable only as needed.
 - **Contributing**: Open issues/PRs on the repository.
 
 For questions, see the in-app help (`--help`) or source code. Enjoy chatting with Grok! 🚀

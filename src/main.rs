@@ -18,13 +18,15 @@ use std::io::Cursor;
 use log;
 use dirs;
 use toml;
-use shell_words::split; // Added for safe RG command parsing
+use shell_words::split; // Added for safe RG and FD command parsing
 
 const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
 const MAX_LEVEL: u32 = 7;
 const RG_TIMEOUT_SECS: u64 = 30; // Added for RG command timeout
 const MAX_RG_OUTPUT_BYTES: usize = 50 * 1024; // Added for RG output limit
+const FD_TIMEOUT_SECS: u64 = 30; // Added for FD command timeout
+const MAX_FD_OUTPUT_BYTES: usize = 50 * 1024; // Added for FD output limit
 
 const SYSTEM_INSTRUCTIONS: &str = r#"
 You are Grok, a helpful AI and coding assistant. **To provide the most accurate and helpful responses, actively request the contents of relevant files whenever you need them to verify assumptions, check details, or gather more context—even if the user hasn't explicitly asked. For example, if a query involves code, configurations, or project structure, request the necessary files proactively.**
@@ -39,6 +41,11 @@ To perform grep-like searches on the project, respond with **EXACTLY** this form
 GROK RUNS RG: rg <safe-args-and-patterns>
 Examples: GROK RUNS RG: rg -i "error" --glob "**/*.rs" --line-number
 Use --glob for patterns (e.g., --glob "**/*.rs" for all Rust files recursively). Avoid bare globs like src/*.rs without --glob. Allowed args: common ripgrep flags like -i, -n, --type rust, paths (relative only). No execution or shell metacharacters.
+
+To search for files and directories on the project, respond with **EXACTLY** this format and **NOTHING ELSE** (chaining until done):
+GROK RUNS FD: fd <safe-args-and-patterns>
+Examples: GROK RUNS FD: fd --type f --glob "*.md" --max-depth 2
+Allowed args: common fd flags like --type, --glob, --max-depth, paths (relative only). No execution or shell metacharacters.
 "#;
 
 const DEFAULT_CHAT_FILE: &str = "./gchat.md";
@@ -49,6 +56,7 @@ const DEFAULT_API_TIMEOUT: &str = "600";
 const DEFAULT_AUTO_REQUEST_FILES: bool = false;
 const DEFAULT_AUTO_INCREASE_MAX_TOKENS: bool = false;
 const DEFAULT_ALLOW_RG_COMMANDS: bool = false; // Added default
+const DEFAULT_ALLOW_FD_COMMANDS: bool = false; // Added default
 
 fn contains_traversal(p: &str) -> bool {
     Path::new(p).components().any(|c| matches!(c, Component::ParentDir))
@@ -64,6 +72,7 @@ struct Config {
     auto_request_files: Option<bool>,
     auto_increase_max_tokens: Option<bool>,
     allow_rg_commands: Option<bool>, // Added
+    allow_fd_commands: Option<bool>, // Added
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -104,6 +113,7 @@ async fn main() -> io::Result<()> {
         auto_request_files: None,
         auto_increase_max_tokens: None,
         allow_rg_commands: None, // Added
+        allow_fd_commands: None, // Added
     };
     if let Some(config_dir) = dirs::config_dir() {
         let config_path = config_dir.join("gchat/config.toml");
@@ -177,6 +187,13 @@ async fn main() -> io::Result<()> {
                 .long("allow-rg-commands")
                 .help("Allow Grok to run safe ripgrep commands on the project")
                 .action(clap::ArgAction::SetTrue),
+        )
+        .arg( // Added
+            Arg::new("allow_fd_commands")
+                .short('d')
+                .long("allow-fd-commands")
+                .help("Allow Grok to run safe fd commands on the project")
+                .action(clap::ArgAction::SetTrue),
         );
 
     let matches = app.get_matches();
@@ -230,6 +247,12 @@ async fn main() -> io::Result<()> {
         config.allow_rg_commands.unwrap_or(DEFAULT_ALLOW_RG_COMMANDS)
     };
 
+    let allow_fd_commands = if matches.contains_id("allow_fd_commands") { // Added
+        true
+    } else {
+        config.allow_fd_commands.unwrap_or(DEFAULT_ALLOW_FD_COMMANDS)
+    };
+
     // Parse the default level and max_tokens (using the final max_tokens_str)
     let default_level = match get_level_from_str(&max_tokens_str) {
         Ok(v) => v,
@@ -262,6 +285,7 @@ async fn main() -> io::Result<()> {
     println!("  Auto request files: {}", auto_request_files);
     println!("  Auto increase max tokens: {}", auto_increase_max_tokens);
     println!("  Allow RG commands: {}", allow_rg_commands); // Added
+    println!("  Allow FD commands: {}", allow_fd_commands); // Added
 
     println!("App started. Polling {} for changes every 1 second.", chat_file);
 
@@ -274,6 +298,7 @@ async fn main() -> io::Result<()> {
         auto_request_files,
         auto_increase_max_tokens,
         allow_rg_commands, // Added
+        allow_fd_commands, // Added
         &model,
     )
     .await
@@ -310,6 +335,7 @@ async fn main() -> io::Result<()> {
                 auto_request_files,
                 auto_increase_max_tokens,
                 allow_rg_commands, // Added
+                allow_fd_commands, // Added
                 &model,
             )
             .await
@@ -352,6 +378,7 @@ async fn process_chat_file(
     auto_request_files: bool,
     auto_increase_max_tokens: bool,
     allow_rg_commands: bool, // Added
+    allow_fd_commands: bool, // Added
     model: &str,
 ) -> io::Result<()> {
     // Short debounce to ensure save is complete (helps with atomic saves)
@@ -613,6 +640,36 @@ async fn process_chat_file(
                         false
                     };
 
+                    // Check if this is an FD request (only if flag is enabled) -- Added
+                    let is_fd_request = if allow_fd_commands {
+                        let trimmed = assistant_content.trim();
+                        if trimmed.starts_with("GROK RUNS FD:") {
+                            let rest = trimmed.strip_prefix("GROK RUNS FD:").unwrap().trim();
+                            if !rest.is_empty() && trimmed == format!("GROK RUNS FD: {}", rest) {
+                                let cwd = env::current_dir()?;
+                                match run_fd_command(rest, &cwd).await {
+                                    Ok(output) => {
+                                        // Append to file
+                                        let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
+                                        writeln!(file, "\n\nGROK RAN FD: {}\n```\n{}\n```\n", rest, output)?;
+                                        true  // Set needs_reprocess
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed FD command '{}': {}", rest, e);
+                                        play_warning();  // Optional
+                                        false
+                                    }
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
                     // If it was a valid file request, break inner loop to allow outer loop to re-read
                     if is_file_request {
                         needs_reprocess = true;
@@ -621,6 +678,12 @@ async fn process_chat_file(
 
                     // If it was a valid RG request, break inner loop to re-read -- Added
                     if is_rg_request {
+                        needs_reprocess = true;
+                        break;
+                    }
+
+                    // If it was a valid FD request, break inner loop to re-read -- Added
+                    if is_fd_request {
                         needs_reprocess = true;
                         break;
                     }
@@ -987,6 +1050,62 @@ async fn run_rg_command(command_line: &str, cwd: &Path) -> io::Result<String> {
         }
         Ok(Err(e)) => Ok(format!("RG command failed: {}\n", e)),
         Err(_) => Ok("RG command timed out.\n".to_string()),
+    }
+}
+
+// Added: Safety check for FD commands
+fn is_safe_fd_command(command_line: &str) -> bool {
+    // Basic safety check: must start with "fd "
+    if !command_line.trim().starts_with("fd ") {
+        return false;
+    }
+    // Parse args safely
+    let args = match split(command_line.trim()) {
+        Ok(a) => a,
+        Err(_) => return false,  // Invalid shell-like syntax
+    };
+    if args.first() != Some(&"fd".to_string()) {
+        return false;
+    }
+    // Whitelist safe flags (add more as needed based on fd docs)
+    let safe_flags = vec!["--type", "--glob", "--max-depth", "--min-depth", "--size", "--changed-before", "--changed-within", "--exclude"];
+    for arg in &args[1..] {
+        if arg.contains(&['|', '>', '<', '&', ';'][..]) || arg.starts_with("../") || Path::new(arg).is_absolute() {
+            return false;  // Forbidden metachar or absolute/traversal
+        }
+        // Allow flags in whitelist
+        if safe_flags.contains(&arg.as_str()) {
+            continue;
+        }
+        // Allow strings/patterns if not starting with -
+        if !arg.starts_with('-') {
+            continue;  // Assume paths/patterns are okay
+        }
+        return false;  // Unknown/unallowed flag
+    }
+    true
+}
+
+// Added: Execute safe FD command
+async fn run_fd_command(command_line: &str, cwd: &Path) -> io::Result<String> {
+    if !is_safe_fd_command(command_line) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid or unsafe FD command"));
+    }
+    let args = split(command_line.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Parse error: {}", e)))?;
+    let mut cmd = std::process::Command::new("fd");
+    cmd.args(&args[1..]).current_dir(cwd).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    // Timeout
+    match tokio::time::timeout(Duration::from_secs(FD_TIMEOUT_SECS), tokio::process::Command::from(cmd).output()).await {
+        Ok(Ok(output)) => {
+            let mut result = String::from_utf8_lossy(&output.stdout).to_string() + &String::from_utf8_lossy(&output.stderr);
+            if result.len() > MAX_FD_OUTPUT_BYTES {
+                result.truncate(MAX_FD_OUTPUT_BYTES);
+                result.push_str("\n[Output truncated]\n");
+            }
+            Ok(result)
+        }
+        Ok(Err(e)) => Ok(format!("FD command failed: {}\n", e)),
+        Err(_) => Ok("FD command timed out.\n".to_string()),
     }
 }
 
