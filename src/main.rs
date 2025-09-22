@@ -18,10 +18,13 @@ use std::io::Cursor;
 use log;
 use dirs;
 use toml;
+use shell_words::split; // Added for safe RG command parsing
 
 const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
 const MAX_LEVEL: u32 = 7;
+const RG_TIMEOUT_SECS: u64 = 30; // Added for RG command timeout
+const MAX_RG_OUTPUT_BYTES: usize = 50 * 1024; // Added for RG output limit
 
 const SYSTEM_INSTRUCTIONS: &str = r#"
 You are Grok, a helpful AI and coding assistant. **To provide the most accurate and helpful responses, actively request the contents of relevant files whenever you need them to verify assumptions, check details, or gather more context—even if the user hasn't explicitly asked. For example, if a query involves code, configurations, or project structure, request the necessary files proactively.**
@@ -31,6 +34,11 @@ GROK REQUESTS FILES: relative/path1, relative/path2
 Paths must be relative to the current working directory (e.g., src/main.rs, not /absolute/path or ../outside). Do not request files outside the project directory. You can request multiple files, directories, or globs (e.g., src/*.rs). The system will automatically include their contents in the next user message. Request all needed files at once if possible. You may request again if more are needed after seeing the contents.
 
 **Only request files when they are genuinely needed to improve your response. If you have sufficient information, provide a direct answer without requesting.**
+
+To perform grep-like searches on the project, respond with **EXACTLY** this format and **NOTHING ELSE** (chaining until done):
+GROK RUNS RG: rg <safe-args-and-patterns>
+Examples: GROK RUNS RG: rg -i "error" --glob "**/*.rs" --line-number
+Use --glob for patterns (e.g., --glob "**/*.rs" for all Rust files recursively). Avoid bare globs like src/*.rs without --glob. Allowed args: common ripgrep flags like -i, -n, --type rust, paths (relative only). No execution or shell metacharacters.
 "#;
 
 const DEFAULT_CHAT_FILE: &str = "./gchat.md";
@@ -40,6 +48,7 @@ const DEFAULT_MODEL: &str = "grok-code-fast-1";
 const DEFAULT_API_TIMEOUT: &str = "600";
 const DEFAULT_AUTO_REQUEST_FILES: bool = false;
 const DEFAULT_AUTO_INCREASE_MAX_TOKENS: bool = false;
+const DEFAULT_ALLOW_RG_COMMANDS: bool = false; // Added default
 
 fn contains_traversal(p: &str) -> bool {
     Path::new(p).components().any(|c| matches!(c, Component::ParentDir))
@@ -54,6 +63,7 @@ struct Config {
     api_timeout: Option<u64>,
     auto_request_files: Option<bool>,
     auto_increase_max_tokens: Option<bool>,
+    allow_rg_commands: Option<bool>, // Added
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -93,6 +103,7 @@ async fn main() -> io::Result<()> {
         api_timeout: None,
         auto_request_files: None,
         auto_increase_max_tokens: None,
+        allow_rg_commands: None, // Added
     };
     if let Some(config_dir) = dirs::config_dir() {
         let config_path = config_dir.join("gchat/config.toml");
@@ -159,6 +170,13 @@ async fn main() -> io::Result<()> {
                 .long("auto-increase-max-tokens")
                 .help("Automatically increase max_tokens on truncation")
                 .action(clap::ArgAction::SetTrue),
+        )
+        .arg( // Added
+            Arg::new("allow_rg_commands")
+                .short('r')
+                .long("allow-rg-commands")
+                .help("Allow Grok to run safe ripgrep commands on the project")
+                .action(clap::ArgAction::SetTrue),
         );
 
     let matches = app.get_matches();
@@ -206,6 +224,12 @@ async fn main() -> io::Result<()> {
         config.auto_increase_max_tokens.unwrap_or(DEFAULT_AUTO_INCREASE_MAX_TOKENS)
     };
 
+    let allow_rg_commands = if matches.contains_id("allow_rg_commands") { // Added
+        true
+    } else {
+        config.allow_rg_commands.unwrap_or(DEFAULT_ALLOW_RG_COMMANDS)
+    };
+
     // Parse the default level and max_tokens (using the final max_tokens_str)
     let default_level = match get_level_from_str(&max_tokens_str) {
         Ok(v) => v,
@@ -237,6 +261,7 @@ async fn main() -> io::Result<()> {
     println!("  API timeout: {} seconds", api_timeout);
     println!("  Auto request files: {}", auto_request_files);
     println!("  Auto increase max tokens: {}", auto_increase_max_tokens);
+    println!("  Allow RG commands: {}", allow_rg_commands); // Added
 
     println!("App started. Polling {} for changes every 1 second.", chat_file);
 
@@ -248,6 +273,7 @@ async fn main() -> io::Result<()> {
         api_timeout,
         auto_request_files,
         auto_increase_max_tokens,
+        allow_rg_commands, // Added
         &model,
     )
     .await
@@ -283,6 +309,7 @@ async fn main() -> io::Result<()> {
                 api_timeout,
                 auto_request_files,
                 auto_increase_max_tokens,
+                allow_rg_commands, // Added
                 &model,
             )
             .await
@@ -324,6 +351,7 @@ async fn process_chat_file(
     api_timeout: u64,
     auto_request_files: bool,
     auto_increase_max_tokens: bool,
+    allow_rg_commands: bool, // Added
     model: &str,
 ) -> io::Result<()> {
     // Short debounce to ensure save is complete (helps with atomic saves)
@@ -555,8 +583,44 @@ async fn process_chat_file(
                         false
                     };
 
+                    // Check if this is an RG request (only if flag is enabled) -- Added
+                    let is_rg_request = if allow_rg_commands {
+                        let trimmed = assistant_content.trim();
+                        if trimmed.starts_with("GROK RUNS RG:") {
+                            let rest = trimmed.strip_prefix("GROK RUNS RG:").unwrap().trim();
+                            if !rest.is_empty() && trimmed == format!("GROK RUNS RG: {}", rest) {
+                                let cwd = env::current_dir()?;
+                                match run_rg_command(rest, &cwd).await {
+                                    Ok(output) => {
+                                        // Append to file
+                                        let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
+                                        writeln!(file, "\n\nGROK RAN RG: {}\n```\n{}\n```\n", rest, output)?;
+                                        true  // Set needs_reprocess
+                                    }
+                                    Err(e) => {
+                                        log::warn!("Failed RG command '{}': {}", rest, e);
+                                        play_warning();  // Optional
+                                        false
+                                    }
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
                     // If it was a valid file request, break inner loop to allow outer loop to re-read
                     if is_file_request {
+                        needs_reprocess = true;
+                        break;
+                    }
+
+                    // If it was a valid RG request, break inner loop to re-read -- Added
+                    if is_rg_request {
                         needs_reprocess = true;
                         break;
                     }
@@ -589,7 +653,7 @@ async fn process_chat_file(
 
                     // If still truncated at max level, print warning
                     if is_truncated {
-                        println!("Warning: Response truncated even at max level L{} ({} tokens)!", MAX_LEVEL, parse_level(MAX_LEVEL));
+                        println!("Warning: Response truncated even at max L{} ({} tokens)!", MAX_LEVEL, parse_level(MAX_LEVEL));
                     }
 
                     // Play chime sound
@@ -863,6 +927,66 @@ fn expand_dir_tree(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
             failed_paths.push(path_str.to_string()); // Add invalid/outside directory
             (format!("The requested directory {} is unavailable (outside project or invalid).\n", path_str), had_error, failed_paths)
         }
+    }
+}
+
+// Added: Safety check for RG commands
+fn is_safe_rg_command(command_line: &str) -> bool {
+    // Basic safety check: must start with "rg "
+    if !command_line.trim().starts_with("rg ") {
+        return false;
+    }
+    // Parse args safely
+    let args = match split(command_line.trim()) {
+        Ok(a) => a,
+        Err(_) => return false,  // Invalid shell-like syntax
+    };
+    if args.first() != Some(&"rg".to_string()) {
+        return false;
+    }
+    // Whitelist safe flags (example: add more as needed)
+    let safe_flags = vec!["--line-number", "-n", "--case-insensitive", "-i", "--fixed-strings", "-F", "--word-regexp", "-w", "--after-context", "-A", "--before-context", "-B", "--context", "-C", "--type", "--type-add", "--max-columns", "--glob"];
+    for arg in &args[1..] {
+        if arg.contains(&['|', '>', '<', '&', ';'][..]) || arg.starts_with("../") || Path::new(arg).is_absolute() {
+            return false;  // Forbidden metachar or absolute/traversal
+        }
+        // Allow numeric args after flags like -A
+        if safe_flags.contains(&arg.as_str()) {
+            continue;
+        }
+        // Allow numbers after certain flags (simple check)
+        if arg.chars().all(|c| c.is_numeric()) {
+            continue;  // e.g., 5 after -A
+        }
+        // Allow patterns (strings) and paths if not starting with -
+        if !arg.starts_with('-') {
+            continue;  // Assume patterns/paths are okay if not flag-like
+        }
+        return false;  // Unknown/unallowed flag
+    }
+    true
+}
+
+// Added: Execute safe RG command
+async fn run_rg_command(command_line: &str, cwd: &Path) -> io::Result<String> {
+    if !is_safe_rg_command(command_line) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid or unsafe RG command"));
+    }
+    let args = split(command_line.trim()).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, format!("Parse error: {}", e)))?;
+    let mut cmd = std::process::Command::new("rg");
+    cmd.args(&args[1..]).current_dir(cwd).stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped());
+    // Timeout using tokio::time
+    match tokio::time::timeout(Duration::from_secs(RG_TIMEOUT_SECS), tokio::process::Command::from(cmd).output()).await {
+        Ok(Ok(output)) => {
+            let mut result = String::from_utf8_lossy(&output.stdout).to_string() + &String::from_utf8_lossy(&output.stderr);
+            if result.len() > MAX_RG_OUTPUT_BYTES {
+                result.truncate(MAX_RG_OUTPUT_BYTES);
+                result.push_str("\n[Output truncated]\n");
+            }
+            Ok(result)
+        }
+        Ok(Err(e)) => Ok(format!("RG command failed: {}\n", e)),
+        Err(_) => Ok("RG command timed out.\n".to_string()),
     }
 }
 
