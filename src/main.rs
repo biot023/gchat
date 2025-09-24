@@ -19,10 +19,11 @@ use log;
 use dirs;
 use toml;
 use shell_words::split; // Added for safe RG and FD command parsing
+use std::collections::HashMap; // NEW: For profiles
 
 const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
-const MAX_LEVEL: u32 = 7;
+const MAX_LEVEL: u32 = 12; // UPDATED: Increased from 7 to 12 for ~2M tokens
 const RG_TIMEOUT_SECS: u64 = 30; // Added for RG command timeout
 const MAX_RG_OUTPUT_BYTES: usize = 50 * 1024; // Added for RG output limit
 const FD_TIMEOUT_SECS: u64 = 30; // Added for FD command timeout
@@ -48,6 +49,16 @@ Examples: GROK RUNS FD: fd --type f --glob "*.md" --max-depth 2
 Allowed args: common fd flags like --type, --glob, --max-depth, paths (relative only). No execution or shell metacharacters.
 "#;
 
+const WRITE_INSTRUCTIONS: &str = r#"
+To write file contents, if the user prompt contains a placeholder like `@w:relative/path` (indicating they want you to generate and provide the full content for that file), respond with **EXACTLY** this format and **NOTHING ELSE**:
+GROK WRITES TO FILE: relative/path
+[full exact content here, with no markdown formatting, code blocks, or extra explanations— just the raw content to write to the file]
+
+The path must exactly match the relative path specified in the `@w:path` placeholder from the user's current prompt (case-sensitive, no modifications). For example, if the user says `@w:src/main.rs`, only use that exact path—do not invent or alter paths.
+
+Paths must be relative to the current working directory (e.g., README.md or src/main.rs, not /absolute/path or ../outside). Do not request writes outside the project directory. The system will validate and write the content safely. Only use this if the user explicitly requests writing to a specific file via the `@w:` placeholder, and only for the exact path they specified.
+**Only respond in this format when genuinely needed to fulfill a write request. Otherwise, provide a normal response."#;
+
 const DEFAULT_CHAT_FILE: &str = "./gchat.md";
 const DEFAULT_MAX_TOKENS: &str = "L3";
 const DEFAULT_TEMPERATURE: &str = "1.0";
@@ -57,12 +68,13 @@ const DEFAULT_AUTO_REQUEST_FILES: bool = false;
 const DEFAULT_AUTO_INCREASE_MAX_TOKENS: bool = false;
 const DEFAULT_ALLOW_RG_COMMANDS: bool = false; // Added default
 const DEFAULT_ALLOW_FD_COMMANDS: bool = false; // Added default
+const DEFAULT_ALLOW_FILE_WRITES: bool = false; // NEW: For file writes
 
 fn contains_traversal(p: &str) -> bool {
     Path::new(p).components().any(|c| matches!(c, Component::ParentDir))
 }
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone)] // UPDATED: Added Clone for profiles
 struct Config {
     chat_file: Option<String>,
     max_tokens: Option<String>,
@@ -73,6 +85,7 @@ struct Config {
     auto_increase_max_tokens: Option<bool>,
     allow_rg_commands: Option<bool>, // Added
     allow_fd_commands: Option<bool>, // Added
+    allow_file_writes: Option<bool>, // NEW
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -102,33 +115,11 @@ struct Choice {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
-    env_logger::init();
+    env_logger::Builder::from_default_env()
+        .format(|buf, record| write!(buf, "{}", record.args()))
+        .init();
 
-    let mut config: Config = Config {
-        chat_file: None,
-        max_tokens: None,
-        temperature: None,
-        model: None,
-        api_timeout: None,
-        auto_request_files: None,
-        auto_increase_max_tokens: None,
-        allow_rg_commands: None, // Added
-        allow_fd_commands: None, // Added
-    };
-    if let Some(config_dir) = dirs::config_dir() {
-        let config_path = config_dir.join("gchat/config.toml");
-        if config_path.exists() {
-            let config_content = fs::read_to_string(&config_path)?;
-            config = toml::from_str(&config_content).map_err(|e| {
-                eprintln!("Error parsing config file {}: {}", config_path.display(), e);
-                io::Error::new(io::ErrorKind::InvalidData, e)
-            })?;
-            println!("Loaded config from {}", config_path.display());
-        } else {
-            println!("No config file found at {}", config_path.display());
-        }
-    }
-
+    // UPDATED: CLI app with profile arg and temperature short changed to 'P'
     let app = Command::new("gchat")
         .version(env!("CARGO_PKG_VERSION"))
         .about("A utility to communicate with the Grok 4 API via a watched chat file.")
@@ -148,8 +139,8 @@ async fn main() -> io::Result<()> {
                 .help("Default max tokens level"),
         )
         .arg(
-            Arg::new("temperature")
-                .short('p')
+            Arg::new("temperature")  // UPDATED: Changed short from 'p' to 'P'
+                .short('P')
                 .long("temperature")
                 .value_name("FLOAT")
                 .help("Default temperature"),
@@ -194,9 +185,114 @@ async fn main() -> io::Result<()> {
                 .long("allow-fd-commands")
                 .help("Allow Grok to run safe fd commands on the project")
                 .action(clap::ArgAction::SetTrue),
+        )
+        .arg( // NEW
+            Arg::new("allow_file_writes")
+                .short('w')
+                .long("allow-file-writes")
+                .help("Allow Grok to write generated content to project files via special responses")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg( // NEW: Profile arg
+            Arg::new("profile")
+                .short('p')
+                .long("profile")
+                .value_name("NAME")
+                .help("Profile name from config.toml (e.g., 'default' or 'x')"),
         );
 
     let matches = app.get_matches();
+
+    // UPDATED: Profile-aware config loading
+    let mut config: Config = Config {
+        chat_file: None,
+        max_tokens: None,
+        temperature: None,
+        model: None,
+        api_timeout: None,
+        auto_request_files: None,
+        auto_increase_max_tokens: None,
+        allow_rg_commands: None,
+        allow_fd_commands: None,
+        allow_file_writes: None, // NEW
+    };
+
+    let mut config_loaded = false;
+    if let Some(config_dir) = dirs::config_dir() {
+        let config_path = config_dir.join("gchat/config.toml");
+        if config_path.exists() {
+            match fs::read_to_string(&config_path) {
+                Ok(config_content) => {
+                    // Try to parse as profile table (HashMap<String, Config>)
+                    match toml::from_str::<HashMap<String, Config>>(&config_content) {
+                        Ok(config_table) => {
+                            if !config_table.is_empty() {
+                                // Select profile
+                                let profile_name = matches.get_one::<String>("profile").cloned();
+                                let selected = if let Some(name) = &profile_name {
+                                    // Use specified profile if exists
+                                    if let Some(selected_config) = config_table.get(name) {
+                                        println!("Loaded profile '{}' from {}", name, config_path.display());
+                                        selected_config.clone()
+                                    } else {
+                                        // Fallback: try "default", then first
+                                        eprintln!("Profile '{}' not found. Falling back to 'default' or first profile.", name);
+                                        if let Some(default_config) = config_table.get("default") {
+                                            println!("Using 'default' profile from {}", config_path.display());
+                                            default_config.clone()
+                                        } else if let Some(first) = config_table.values().next() {
+                                            let first_key = config_table.keys().next().unwrap();  // For logging
+                                            println!("Using first profile '{}' from {}", first_key, config_path.display());
+                                            first.clone()
+                                        } else {
+                                            config.clone()  // Pure defaults
+                                        }
+                                    }
+                                } else {
+                                    // No profile specified: prioritize "default", else first
+                                    if let Some(default_config) = config_table.get("default") {
+                                        println!("Using 'default' profile from {}", config_path.display());
+                                        default_config.clone()
+                                    } else if let Some(first) = config_table.values().next() {
+                                        let first_key = config_table.keys().next().unwrap();  // For logging
+                                        println!("Using first profile '{}' from {}", first_key, config_path.display());
+                                        first.clone()
+                                    } else {
+                                        config.clone()  // Pure defaults
+                                    }
+                                };
+
+                                config = selected;
+                                config_loaded = true;
+                            }
+                        }
+                        Err(e) => {
+                            // Fallback: Try legacy single-config parse (for backward compat)
+                            match toml::from_str::<Config>(&config_content) {
+                                Ok(legacy_config) => {
+                                    config = legacy_config;
+                                    config_loaded = true;
+                                    println!("Loaded legacy single config from {}", config_path.display());
+                                }
+                                Err(_) => {
+                                    eprintln!("Error parsing config file {} (tried profiles and legacy): {}", config_path.display(), e);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error reading config file {}: {}", config_path.display(), e);
+                }
+            }
+        } else {
+            println!("No config file found at {}", config_path.display());
+        }
+    }
+
+    if !config_loaded {
+        println!("No config loaded; using defaults.");
+    }
 
     // Extract final values: CLI overrides config overrides defaults
     let chat_file = if matches.contains_id("chat_file") {
@@ -211,8 +307,8 @@ async fn main() -> io::Result<()> {
         config.max_tokens.unwrap_or(DEFAULT_MAX_TOKENS.to_string())
     };
 
-    let temperature = if matches.contains_id("temperature") {
-        matches.get_one::<String>("temperature").unwrap().parse::<f32>().unwrap()
+    let temperature = if matches.contains_id("temperature") {  // ID unchanged
+        matches.get_one::<String>("temperature").unwrap().parse::<f32>().unwrap_or(1.0)
     } else {
         config.temperature.unwrap_or(DEFAULT_TEMPERATURE.parse::<f32>().unwrap())
     };
@@ -224,7 +320,7 @@ async fn main() -> io::Result<()> {
     };
 
     let api_timeout = if matches.contains_id("api_timeout") {
-        matches.get_one::<String>("api_timeout").unwrap().parse::<u64>().unwrap()
+        matches.get_one::<String>("api_timeout").unwrap().parse::<u64>().unwrap_or(600)
     } else {
         config.api_timeout.unwrap_or(DEFAULT_API_TIMEOUT.parse::<u64>().unwrap())
     };
@@ -251,6 +347,12 @@ async fn main() -> io::Result<()> {
         true
     } else {
         config.allow_fd_commands.unwrap_or(DEFAULT_ALLOW_FD_COMMANDS)
+    };
+
+    let allow_file_writes = if matches.contains_id("allow_file_writes") { // NEW
+        true
+    } else {
+        config.allow_file_writes.unwrap_or(DEFAULT_ALLOW_FILE_WRITES)
     };
 
     // Parse the default level and max_tokens (using the final max_tokens_str)
@@ -286,6 +388,7 @@ async fn main() -> io::Result<()> {
     println!("  Auto increase max tokens: {}", auto_increase_max_tokens);
     println!("  Allow RG commands: {}", allow_rg_commands); // Added
     println!("  Allow FD commands: {}", allow_fd_commands); // Added
+    println!("  Allow file writes: {}", allow_file_writes); // NEW
 
     println!("App started. Polling {} for changes every 1 second.", chat_file);
 
@@ -299,6 +402,7 @@ async fn main() -> io::Result<()> {
         auto_increase_max_tokens,
         allow_rg_commands, // Added
         allow_fd_commands, // Added
+        allow_file_writes, // NEW
         &model,
     )
     .await
@@ -336,6 +440,7 @@ async fn main() -> io::Result<()> {
                 auto_increase_max_tokens,
                 allow_rg_commands, // Added
                 allow_fd_commands, // Added
+                allow_file_writes, // NEW
                 &model,
             )
             .await
@@ -379,6 +484,7 @@ async fn process_chat_file(
     auto_increase_max_tokens: bool,
     allow_rg_commands: bool, // Added
     allow_fd_commands: bool, // Added
+    allow_file_writes: bool, // NEW
     model: &str,
 ) -> io::Result<()> {
     // Short debounce to ensure save is complete (helps with atomic saves)
@@ -389,7 +495,7 @@ async fn process_chat_file(
         let content = fs::read_to_string(chat_path)?;
         let mut messages = parse_chat_messages(&content);
 
-        if messages.is_empty() || messages.last().unwrap().role != "user" || messages.last().unwrap().content.trim().is_empty() {
+        if messages.is_empty() || messages.last().map_or(true, |m| m.role != "user" || m.content.trim().is_empty()) {
             println!("No complete user prompt to process in chat file.");
             return Ok(()); // No send needed
         }
@@ -507,15 +613,34 @@ async fn process_chat_file(
             play_warning();
         }
 
+        // NEW: Regex for extracting @w paths from last user message (for validation later)
+        let re_w = Regex::new(r"@w\s*:\s*(\S+)").unwrap();
+        let last_user_msg = messages.last().map_or("", |m| m.content.as_str());
+        let mut allowed_write_paths: Vec<String> = re_w
+            .captures_iter(last_user_msg)
+            .map(|cap| cap.get(1).unwrap().as_str().trim().to_string())
+            .collect();
+        allowed_write_paths.sort(); // For easy lookup
+        allowed_write_paths.dedup(); // Unique paths only
+        log::debug!("Allowed write paths from last user prompt: {:?}", allowed_write_paths);
+
         // Log the expanded messages (DEBUG level)
         log::debug!("Expanded messages for API request: {:?}", messages);
 
-        // Prepend system instructions ONLY if flag is enabled
-        let mut api_messages = messages.clone();  // Clone to avoid mutating original
+        // UPDATED: Conditionally build system content
+        let mut system_content = String::new();
         if auto_request_files {
+            system_content.push_str(SYSTEM_INSTRUCTIONS);
+        }
+        if allow_file_writes {
+            system_content.push_str(WRITE_INSTRUCTIONS);
+        }
+
+        let mut api_messages = messages.clone();  // Clone to avoid mutating original
+        if !system_content.is_empty() {
             api_messages.insert(0, Message {
                 role: "system".to_string(),
-                content: SYSTEM_INSTRUCTIONS.to_string(),
+                content: system_content,
             });
         }
 
@@ -565,6 +690,89 @@ async fn process_chat_file(
                     let assistant_content = chat_resp.choices[0].message.content.clone();
                     let finish_reason = chat_resp.choices[0].finish_reason.clone();
 
+                    // UPDATED: Check if this is a file write request (now with path validation against allowed paths)
+                    let is_write_request = if allow_file_writes && !allowed_write_paths.is_empty() {
+                        let trimmed = assistant_content.trim();
+                        if trimmed.starts_with("GROK WRITES TO FILE:") {
+                            // Parse: Expect "GROK WRITES TO FILE: path\n\ncontent"
+                            let parts: Vec<&str> = trimmed.splitn(2, "\n\n").collect();
+                            if parts.len() == 2 {
+                                let header = parts[0].trim();
+                                let content = parts[1].trim();
+                                if header.starts_with("GROK WRITES TO FILE:") {
+                                    let path_str = header.strip_prefix("GROK WRITES TO FILE:").unwrap().trim().to_string();
+
+                                    // NEW: Validate against allowed paths from user's @w: placeholders
+                                    if !allowed_write_paths.contains(&path_str) {
+                                        log::warn!("Grok requested write to '{}', but it doesn't match any @w: path in user prompt ('{:?}'). Treating as normal response.", path_str, allowed_write_paths);
+                                        false
+                                    } else {
+                                        let path = PathBuf::from(&path_str);
+
+                                        // Existing validation: relative, no traversal, within cwd
+                                        let cwd = env::current_dir()?;
+                                        if path.is_absolute() || path_str.starts_with("..") || path_str.contains("..") || contains_traversal(&path_str) {
+                                            println!("Warning: Invalid path for write (traversal or absolute): {}", path_str);
+                                            false
+                                        } else {
+                                            // Resolve full path relative to cwd
+                                            let full_path = cwd.join(&path);
+                                            if let Some(parent) = full_path.parent() {
+                                                if let Err(e) = fs::create_dir_all(parent) {
+                                                    println!("Warning: Failed to create parent directories for {}: {}", path_str, e);
+                                                    // Still try to write, but may fail below
+                                                }
+                                            }
+
+                                            match File::create(&full_path) {  // This overwrites the entire file (truncates to 0 length)
+                                                Ok(mut file) => {
+                                                    if let Err(e) = file.write_all(content.as_bytes()) {
+                                                        println!("Warning: Failed to write to {}: {}", path_str, e);
+                                                        false
+                                                    } else {
+                                                        println!("Successfully overwrote '{}' with generated content ({} bytes).", full_path.display(), content.len());
+                                                        // Append confirmation to chat file (not the full content to save tokens/space)
+                                                        if let Err(e) = fs::OpenOptions::new()
+                                                            .append(true)
+                                                            .open(chat_path)
+                                                            .and_then(|mut f| {
+                                                                writeln!(f, "\n{}:\nGenerated and overwrote content in {}.\n(Full content saved to the file; check it there.)\n\n{}:\n",
+                                                                    GROK_RESPONSE_MARKER, path.display(), USER_PROMPT_MARKER)?;
+                                                                Ok(())
+                                                            })
+                                                        {
+                                                            println!("Warning: Failed to append confirmation to chat: {}", e);
+                                                        }
+                                                        play_chime();
+                                                        true  // Handled successfully
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    println!("Warning: Failed to create/overwrite file {}: {}", path_str, e);
+                                                    false
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    false
+                                }
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    // If it was a write request, break inner loop (already handled above)
+                    if is_write_request {
+                        needs_reprocess = false;  // No reprocess needed for writes
+                        break;
+                    }
+
                     // Check if this is a file request (only if flag is enabled)
                     let is_file_request = if auto_request_files {
                         let trimmed = assistant_content.trim();
@@ -596,6 +804,7 @@ async fn process_chat_file(
                                     }
 
                                     // Set flag to reprocess (re-read file) and break inner loop
+                                    needs_reprocess = true;
                                     true
                                 } else {
                                     false
@@ -622,7 +831,8 @@ async fn process_chat_file(
                                         // Append to file
                                         let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
                                         writeln!(file, "\n\nGROK RAN RG: {}\n```\n{}\n```\n", rest, output)?;
-                                        true  // Set needs_reprocess
+                                        needs_reprocess = true;  // Set needs_reprocess
+                                        true  // Set is_rg_request
                                     }
                                     Err(e) => {
                                         log::warn!("Failed RG command '{}': {}", rest, e);
@@ -652,7 +862,8 @@ async fn process_chat_file(
                                         // Append to file
                                         let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
                                         writeln!(file, "\n\nGROK RAN FD: {}\n```\n{}\n```\n", rest, output)?;
-                                        true  // Set needs_reprocess
+                                        needs_reprocess = true;  // Set needs_reprocess
+                                        true  // Set is_fd_request
                                     }
                                     Err(e) => {
                                         log::warn!("Failed FD command '{}': {}", rest, e);
@@ -672,19 +883,16 @@ async fn process_chat_file(
 
                     // If it was a valid file request, break inner loop to allow outer loop to re-read
                     if is_file_request {
-                        needs_reprocess = true;
                         break;
                     }
 
                     // If it was a valid RG request, break inner loop to re-read -- Added
                     if is_rg_request {
-                        needs_reprocess = true;
                         break;
                     }
 
                     // If it was a valid FD request, break inner loop to re-read -- Added
                     if is_fd_request {
-                        needs_reprocess = true;
                         break;
                     }
 
@@ -756,11 +964,11 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
     let mut current_content = String::new();
 
     for line in content.lines() {
-        if line == "USER PROMPT:" || line == "GROK RESPONSE:" {
+        if line.trim() == "USER PROMPT:" || line.trim() == "GROK RESPONSE:" {
             // Add previous section if content is non-empty
             let trimmed = current_content.trim().to_string();
             if !trimmed.is_empty() {
-                let role = current_role.take().unwrap_or("user".to_string());
+                let role = current_role.take().unwrap_or_else(|| "user".to_string());
                 messages.push(Message {
                     role,
                     content: trimmed,
@@ -768,7 +976,7 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
             }
 
             // Start new section
-            current_role = Some(if line == "USER PROMPT:" { "user".to_string() } else { "assistant".to_string() });
+            current_role = Some(if line.trim() == "USER PROMPT:" { "user".to_string() } else { "assistant".to_string() });
             current_content.clear();
         } else {
             // Append to current content
@@ -779,7 +987,7 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
     // Add the last section if content is non-empty
     let trimmed = current_content.trim().to_string();
     if !trimmed.is_empty() {
-        let role = current_role.unwrap_or("user".to_string());
+        let role = current_role.unwrap_or_else(|| "user".to_string());
         messages.push(Message {
             role,
             content: trimmed,

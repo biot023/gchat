@@ -99,16 +99,32 @@ All are pulled in via `Cargo.toml` during build.
    ```
 
 3. **Optional: Customize Defaults**:
-   Create or edit `~/.config/gchat/config.toml` to override defaults without CLI flags. Example:
-   ```
-   chat_file = "./my-chat.md"
-   max_tokens = "L4"
-   temperature = 0.8
-   auto_request_files = true
-   auto_increase_max_tokens = true
-   allow_rg_commands = true
-   allow_fd_commands = true
-   ```
+### Profiles in Config
+The global config (`~/.config/gchat/config.toml`) now supports **profiles** for different setups (e.g., models, token limits). Use named TOML tables:
+
+```toml
+[default]  # Or any name; this is used if no -p flag
+chat_file = "./gchat.md"
+max_tokens = "L3"
+temperature = 1.0
+model = "grok-code-fast-1"
+api_timeout = 600
+auto_request_files = false
+auto_increase_max_tokens = false
+allow_rg_commands = false
+allow_fd_commands = false
+
+[x]  # Example profile for high-token reasoning
+chat_file = "./gchat.md"
+max_tokens = "L12"  # ~2M tokens
+temperature = 1.0
+model = "grok-4-fast-reasoning"
+api_timeout = 1200
+auto_request_files = true
+auto_increase_max_tokens = true
+allow_rg_commands = true
+allow_fd_commands = true
+```
 
 4. **Run the App**:
    ```
