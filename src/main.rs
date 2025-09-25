@@ -64,28 +64,28 @@ const DEFAULT_MAX_TOKENS: &str = "L3";
 const DEFAULT_TEMPERATURE: &str = "1.0";
 const DEFAULT_MODEL: &str = "grok-code-fast-1";
 const DEFAULT_API_TIMEOUT: &str = "600";
-const DEFAULT_AUTO_REQUEST_FILES: bool = false;
-const DEFAULT_AUTO_INCREASE_MAX_TOKENS: bool = false;
-const DEFAULT_ALLOW_RG_COMMANDS: bool = false; // Added default
-const DEFAULT_ALLOW_FD_COMMANDS: bool = false; // Added default
-const DEFAULT_ALLOW_FILE_WRITES: bool = false; // NEW: For file writes
 
 fn contains_traversal(p: &str) -> bool {
     Path::new(p).components().any(|c| matches!(c, Component::ParentDir))
 }
 
-#[derive(Deserialize, Debug, Clone)] // UPDATED: Added Clone for profiles
+#[derive(Deserialize, Debug, Clone)]
 struct Config {
     chat_file: Option<String>,
     max_tokens: Option<String>,
     temperature: Option<f32>,
     model: Option<String>,
     api_timeout: Option<u64>,
-    auto_request_files: Option<bool>,
-    auto_increase_max_tokens: Option<bool>,
-    allow_rg_commands: Option<bool>, // Added
-    allow_fd_commands: Option<bool>, // Added
-    allow_file_writes: Option<bool>, // NEW
+    #[serde(default)]
+    auto_request_files: bool,
+    #[serde(default)]
+    auto_increase_max_tokens: bool,
+    #[serde(default)]
+    allow_rg_commands: bool,
+    #[serde(default)]
+    allow_fd_commands: bool,
+    #[serde(default)]
+    allow_file_writes: bool,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -120,10 +120,19 @@ async fn main() -> io::Result<()> {
         .init();
 
     // UPDATED: CLI app with profile arg and temperature short changed to 'P'
-    let app = Command::new("gchat")
-        .version(env!("CARGO_PKG_VERSION"))
-        .about("A utility to communicate with the Grok 4 API via a watched chat file.")
-        .long_about("A Rust utility that enables interactive conversations with the Grok API (from xAI) by monitoring a Markdown chat file. The app polls the file every 1 second for changes. When it detects a new user prompt (marked by \"USER PROMPT:\"), it sends the full conversation history to the Grok API, appends the response (marked by \"GROK RESPONSE:\"), and adds a new \"USER PROMPT:\" section for your next input. It plays a pleasant chime sound on successful responses and a warning sound on errors.")
+let app = Command::new("gchat")
+    .version(env!("CARGO_PKG_VERSION"))
+    .about("Chat with Grok effortlessly! A friendly Rust tool for interactive conversations via a Markdown file.")
+    .long_about(
+        "Hey there! 🚀 This is gchat, your handy helper for chatting with Grok 4 (from xAI) right from your favorite text editor.\n\n".to_string() +
+        "Just edit a Markdown file (like ./gchat.md), add your questions, and watch it magically turn into full conversations. It's perfect for developers, writers, or anyone who loves file-based workflows.\n\n" +
+        "Features include:\n" +
+        "  - File watching: No need to switch windows—poll for changes every second.\n" +
+        "  - Smart placeholders: Include code or files with @f: or @d: (e.g., @f:src/main.rs).\n" +
+        "  - Audio vibes: Chime on success, warning tones if things go sideways.\n" +
+        "  - Optional superpowers: Auto-request files, run safe searches (RG/FD), or even let Grok edit your project files!\n\n" +
+        "Get started: Run gchat, edit ./gchat.md, and add 'USER PROMPT: Hello, Grok!'. Happy chatting! 🤖✨"
+    )
         .arg(
             Arg::new("chat_file")
                 .short('f')
@@ -210,11 +219,11 @@ async fn main() -> io::Result<()> {
         temperature: None,
         model: None,
         api_timeout: None,
-        auto_request_files: None,
-        auto_increase_max_tokens: None,
-        allow_rg_commands: None,
-        allow_fd_commands: None,
-        allow_file_writes: None, // NEW
+        auto_request_files: false,
+        auto_increase_max_tokens: false,
+        allow_rg_commands: false,
+        allow_fd_commands: false,
+        allow_file_writes: false,
     };
 
     let mut config_loaded = false;
@@ -325,34 +334,34 @@ async fn main() -> io::Result<()> {
         config.api_timeout.unwrap_or(DEFAULT_API_TIMEOUT.parse::<u64>().unwrap())
     };
 
-    let auto_request_files = if matches.contains_id("auto_request_files") {
+    let auto_request_files = if let Some(true) = matches.get_one::<bool>("auto_request_files") {
         true
     } else {
-        config.auto_request_files.unwrap_or(DEFAULT_AUTO_REQUEST_FILES)
+        config.auto_request_files
     };
 
-    let auto_increase_max_tokens = if matches.contains_id("auto_increase_max_tokens") {
+    let auto_increase_max_tokens = if let Some(true) = matches.get_one::<bool>("auto_increase_max_tokens") {
         true
     } else {
-        config.auto_increase_max_tokens.unwrap_or(DEFAULT_AUTO_INCREASE_MAX_TOKENS)
+        config.auto_increase_max_tokens
     };
 
-    let allow_rg_commands = if matches.contains_id("allow_rg_commands") { // Added
+    let allow_rg_commands = if let Some(true) = matches.get_one::<bool>("allow_rg_commands") {
         true
     } else {
-        config.allow_rg_commands.unwrap_or(DEFAULT_ALLOW_RG_COMMANDS)
+        config.allow_rg_commands
     };
 
-    let allow_fd_commands = if matches.contains_id("allow_fd_commands") { // Added
+    let allow_fd_commands = if let Some(true) = matches.get_one::<bool>("allow_fd_commands") {
         true
     } else {
-        config.allow_fd_commands.unwrap_or(DEFAULT_ALLOW_FD_COMMANDS)
+        config.allow_fd_commands
     };
 
-    let allow_file_writes = if matches.contains_id("allow_file_writes") { // NEW
+    let allow_file_writes = if let Some(true) = matches.get_one::<bool>("allow_file_writes") {
         true
     } else {
-        config.allow_file_writes.unwrap_or(DEFAULT_ALLOW_FILE_WRITES)
+        config.allow_file_writes
     };
 
     // Parse the default level and max_tokens (using the final max_tokens_str)
@@ -496,7 +505,7 @@ async fn process_chat_file(
         let mut messages = parse_chat_messages(&content);
 
         if messages.is_empty() || messages.last().map_or(true, |m| m.role != "user" || m.content.trim().is_empty()) {
-            println!("No complete user prompt to process in chat file.");
+            log::debug!("Skipping process: last section is not a non-empty user prompt");
             return Ok(()); // No send needed
         }
 
@@ -589,6 +598,17 @@ async fn process_chat_file(
             println!("Setting `temperature` API parameter to {}", local_temperature);
         }
 
+        // NEW: Extract @w paths from raw last user content (before any expansion/removal)
+        let raw_last_user = messages.last().and_then(|m| if m.role == "user" { Some(&m.content) } else { None }).map(|s| s.as_str()).unwrap_or("");
+        let re_w = Regex::new(r#"@w\s*:\s*([^\s<>"'`]+)"#).unwrap();  // Stricter regex
+        let mut allowed_write_paths: Vec<String> = re_w
+            .captures_iter(raw_last_user)
+            .map(|cap| cap.get(1).unwrap().as_str().trim().to_string())
+            .collect();
+        allowed_write_paths.sort();
+        allowed_write_paths.dedup();
+        log::debug!("Allowed write paths from raw last user prompt: {:?}", allowed_write_paths);
+
         // Expand other placeholders ONLY in user messages (prompts to the API)
         let mut any_expansion_error = false;
         let mut all_failed_paths = Vec::new(); // New: Collect all failed paths across messages
@@ -612,17 +632,6 @@ async fn process_chat_file(
             }
             play_warning();
         }
-
-        // NEW: Regex for extracting @w paths from last user message (for validation later)
-        let re_w = Regex::new(r"@w\s*:\s*(\S+)").unwrap();
-        let last_user_msg = messages.last().map_or("", |m| m.content.as_str());
-        let mut allowed_write_paths: Vec<String> = re_w
-            .captures_iter(last_user_msg)
-            .map(|cap| cap.get(1).unwrap().as_str().trim().to_string())
-            .collect();
-        allowed_write_paths.sort(); // For easy lookup
-        allowed_write_paths.dedup(); // Unique paths only
-        log::debug!("Allowed write paths from last user prompt: {:?}", allowed_write_paths);
 
         // Log the expanded messages (DEBUG level)
         log::debug!("Expanded messages for API request: {:?}", messages);
@@ -690,23 +699,30 @@ async fn process_chat_file(
                     let assistant_content = chat_resp.choices[0].message.content.clone();
                     let finish_reason = chat_resp.choices[0].finish_reason.clone();
 
-                    // UPDATED: Check if this is a file write request (now with path validation against allowed paths)
+                    // UPDATED: Check if this is a file write request (now with path validation against allowed paths and flexible newline parsing)
                     let is_write_request = if allow_file_writes && !allowed_write_paths.is_empty() {
                         let trimmed = assistant_content.trim();
                         if trimmed.starts_with("GROK WRITES TO FILE:") {
-                            // Parse: Expect "GROK WRITES TO FILE: path\n\ncontent"
-                            let parts: Vec<&str> = trimmed.splitn(2, "\n\n").collect();
-                            if parts.len() == 2 {
-                                let header = parts[0].trim();
-                                let content = parts[1].trim();
-                                if header.starts_with("GROK WRITES TO FILE:") {
+                            // NEW: Robust parsing for single newline after header (find first \n after "GROK WRITES TO FILE:")
+                            if let Some(nl_pos) = trimmed.find("GROK WRITES TO FILE:").map(|start| {
+                                start + "GROK WRITES TO FILE:".len()
+                            }).and_then(|after_prefix| trimmed[after_prefix..].find('\n').map(|p| after_prefix + p)) {
+                                let header_end = nl_pos + 1;  // After the \n
+                                let header = trimmed[..header_end].trim();
+                                let content = trimmed[header_end..].trim_start_matches(|c: char| c.is_whitespace() || c == '\n').to_string();  // Raw content, skipping extra whitespace/newlines
+
+                                if content.is_empty() {
+                                    log::warn!("Write response has empty content after header: {}", header);
+                                    false
+                                } else if header.starts_with("GROK WRITES TO FILE:") {
                                     let path_str = header.strip_prefix("GROK WRITES TO FILE:").unwrap().trim().to_string();
 
-                                    // NEW: Validate against allowed paths from user's @w: placeholders
+                                    // Validate against allowed paths from user's @w: placeholders
                                     if !allowed_write_paths.contains(&path_str) {
                                         log::warn!("Grok requested write to '{}', but it doesn't match any @w: path in user prompt ('{:?}'). Treating as normal response.", path_str, allowed_write_paths);
                                         false
                                     } else {
+                                        log::debug!("Detected valid write request for path: {}", path_str);
                                         let path = PathBuf::from(&path_str);
 
                                         // Existing validation: relative, no traversal, within cwd
@@ -758,6 +774,7 @@ async fn process_chat_file(
                                     false
                                 }
                             } else {
+                                log::warn!("Write response missing newline after 'GROK WRITES TO FILE:': {}", trimmed);
                                 false
                             }
                         } else {
@@ -862,7 +879,7 @@ async fn process_chat_file(
                                         // Append to file
                                         let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
                                         writeln!(file, "\n\nGROK RAN FD: {}\n```\n{}\n```\n", rest, output)?;
-                                        needs_reprocess = true;  // Set needs_reprocess
+                                        needs_reprocess = true;  // Set is_fd_request
                                         true  // Set is_fd_request
                                     }
                                     Err(e) => {
@@ -998,7 +1015,7 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
 }
 
 fn expand_placeholders(text: &str) -> io::Result<(String, bool, Vec<String>)> {
-    let re = Regex::new(r"@f\s*:(\S+)|@d\s*:(\S+)").unwrap();
+    let re = Regex::new(r#"@f\s*:\s*([^\s<>"'`]+)|@d\s*:\s*([^\s<>"'`]+)"#).unwrap();
     let mut result = String::new();
     let mut last_end = 0;
     let mut had_error = false;
