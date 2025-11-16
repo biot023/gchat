@@ -29,7 +29,28 @@ const MAX_RG_OUTPUT_BYTES: usize = 50 * 1024; // Added for RG output limit
 const FD_TIMEOUT_SECS: u64 = 30; // Added for FD command timeout
 const MAX_FD_OUTPUT_BYTES: usize = 50 * 1024; // Added for FD output limit
 
-const SYSTEM_INSTRUCTIONS: &str = r#"
+fn get_system_instructions(provider: &str) -> &'static str {
+    match provider {
+        "claude" => r#"
+You are Claude, a helpful AI and coding assistant. **To provide the most accurate and helpful responses, actively request the contents of relevant files whenever you need them to verify assumptions, check details, or gather more context—even if the user hasn't explicitly asked. For example, if a query involves code, configurations, or project structure, request the necessary files proactively.**
+
+If you decide to request files, respond with **EXACTLY** this format and **NOTHING ELSE**:
+CLAUDE REQUESTS FILES: relative/path1, relative/path2
+Paths must be relative to the current working directory (e.g., src/main.rs, not /absolute/path or ../outside). Do not request files outside the project directory. You can request multiple files, directories, or globs (e.g., src/*.rs). The system will automatically include their contents in the next user message. Request all needed files at once if possible. You may request again if more are needed after seeing the contents.
+
+**Only request files when they are genuinely needed to improve your response. If you have sufficient information, provide a direct answer without requesting.**
+
+To perform grep-like searches on the project, respond with **EXACTLY** this format and **NOTHING ELSE** (chaining until done):
+CLAUDE RUNS RG: rg <safe-args-and-patterns>
+Examples: CLAUDE RUNS RG: rg -i "error" --glob "**/*.rs" --line-number
+Use --glob for patterns (e.g., --glob "**/*.rs" for all Rust files recursively). Avoid bare globs like src/*.rs without --glob. Allowed args: common ripgrep flags like -i, -n, --type rust, paths (relative only). No execution or shell metacharacters.
+
+To search for files and directories on the project, respond with **EXACTLY** this format and **NOTHING ELSE** (chaining until done):
+CLAUDE RUNS FD: fd <safe-args-and-patterns>
+Examples: CLAUDE RUNS FD: fd --type f --glob "*.md" --max-depth 2
+Allowed args: common fd flags like --type, --glob, --max-depth, paths (relative only). No execution or shell metacharacters.
+"#,
+        _ => r#"
 You are Grok, a helpful AI and coding assistant. **To provide the most accurate and helpful responses, actively request the contents of relevant files whenever you need them to verify assumptions, check details, or gather more context—even if the user hasn't explicitly asked. For example, if a query involves code, configurations, or project structure, request the necessary files proactively.**
 
 If you decide to request files, respond with **EXACTLY** this format and **NOTHING ELSE**:
@@ -47,9 +68,22 @@ To search for files and directories on the project, respond with **EXACTLY** thi
 GROK RUNS FD: fd <safe-args-and-patterns>
 Examples: GROK RUNS FD: fd --type f --glob "*.md" --max-depth 2
 Allowed args: common fd flags like --type, --glob, --max-depth, paths (relative only). No execution or shell metacharacters.
-"#;
+"#,
+    }
+}
 
-const WRITE_INSTRUCTIONS: &str = r#"
+fn get_write_instructions(provider: &str) -> &'static str {
+    match provider {
+        "claude" => r#"
+To write file contents, if the user prompt contains a placeholder like `@w:relative/path` (indicating they want you to generate and provide the full content for that file), respond with **EXACTLY** this format and **NOTHING ELSE**:
+CLAUDE WRITES TO FILE: relative/path
+[full exact content here, with no markdown formatting, code blocks, or extra explanations— just the raw content to write to the file]
+
+The path must exactly match the relative path specified in the `@w:path` placeholder from the user's current prompt (case-sensitive, no modifications). For example, if the user says `@w:src/main.rs`, only use that exact path—do not invent or alter paths.
+
+Paths must be relative to the current working directory (e.g., README.md or src/main.rs, not /absolute/path or ../outside). Do not request writes outside the project directory. The system will validate and write the content safely. Only use this if the user explicitly requests writing to a specific file via the `@w:` placeholder, and only for the exact path they specified.
+**Only respond in this format when genuinely needed to fulfill a write request. Otherwise, provide a normal response."#,
+        _ => r#"
 To write file contents, if the user prompt contains a placeholder like `@w:relative/path` (indicating they want you to generate and provide the full content for that file), respond with **EXACTLY** this format and **NOTHING ELSE**:
 GROK WRITES TO FILE: relative/path
 [full exact content here, with no markdown formatting, code blocks, or extra explanations— just the raw content to write to the file]
@@ -57,12 +91,15 @@ GROK WRITES TO FILE: relative/path
 The path must exactly match the relative path specified in the `@w:path` placeholder from the user's current prompt (case-sensitive, no modifications). For example, if the user says `@w:src/main.rs`, only use that exact path—do not invent or alter paths.
 
 Paths must be relative to the current working directory (e.g., README.md or src/main.rs, not /absolute/path or ../outside). Do not request writes outside the project directory. The system will validate and write the content safely. Only use this if the user explicitly requests writing to a specific file via the `@w:` placeholder, and only for the exact path they specified.
-**Only respond in this format when genuinely needed to fulfill a write request. Otherwise, provide a normal response."#;
+**Only respond in this format when genuinely needed to fulfill a write request. Otherwise, provide a normal response."#,
+    }
+}
 
 const DEFAULT_CHAT_FILE: &str = "./gchat.md";
 const DEFAULT_MAX_TOKENS: &str = "L3";
 const DEFAULT_TEMPERATURE: &str = "1.0";
 const DEFAULT_MODEL: &str = "grok-code-fast-1";
+const DEFAULT_PROVIDER: &str = "grok";
 const DEFAULT_API_TIMEOUT: &str = "600";
 
 fn contains_traversal(p: &str) -> bool {
@@ -75,6 +112,7 @@ struct Config {
     max_tokens: Option<String>,
     temperature: Option<f32>,
     model: Option<String>,
+    provider: Option<String>,
     api_timeout: Option<u64>,
     #[serde(default)]
     auto_request_files: bool,
@@ -102,9 +140,29 @@ struct ChatRequest {
     max_tokens: u32,
 }
 
+#[derive(Serialize, Debug)]
+struct ClaudeRequest {
+    model: String,
+    messages: Vec<Message>,
+    temperature: f32,
+    max_tokens: u32,
+    system: Option<String>,
+}
+
 #[derive(Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeResponse {
+    content: Vec<ClaudeContent>,
+    stop_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeContent {
+    text: String,
 }
 
 #[derive(Deserialize)]
@@ -159,7 +217,13 @@ let app = Command::new("gchat")
                 .short('m')
                 .long("model")
                 .value_name("STRING")
-                .help("The Grok model to call"),
+                .help("The AI model to call"),
+        )
+        .arg(
+            Arg::new("provider")
+                .long("provider")
+                .value_name("STRING")
+                .help("AI provider: 'grok' or 'claude'"),
         )
         .arg(
             Arg::new("api_timeout")
@@ -218,6 +282,7 @@ let app = Command::new("gchat")
         max_tokens: None,
         temperature: None,
         model: None,
+        provider: None,
         api_timeout: None,
         auto_request_files: false,
         auto_increase_max_tokens: false,
@@ -322,10 +387,21 @@ let app = Command::new("gchat")
         config.temperature.unwrap_or(DEFAULT_TEMPERATURE.parse::<f32>().unwrap())
     };
 
+    let provider = if matches.contains_id("provider") {
+        matches.get_one::<String>("provider").unwrap().clone()
+    } else {
+        config.provider.unwrap_or(DEFAULT_PROVIDER.to_string())
+    };
+
     let model = if matches.contains_id("model") {
         matches.get_one::<String>("model").unwrap().clone()
     } else {
-        config.model.unwrap_or(DEFAULT_MODEL.to_string())
+        config.model.unwrap_or_else(|| {
+            match provider.as_str() {
+                "claude" => "claude-3-5-sonnet-20241022".to_string(),
+                _ => DEFAULT_MODEL.to_string(),
+            }
+        })
     };
 
     let api_timeout = if matches.contains_id("api_timeout") {
@@ -389,6 +465,7 @@ let app = Command::new("gchat")
     // Print settings on startup
     println!("Running with settings:");
     println!("  Chat file: {}", chat_file);
+    println!("  Provider: {}", provider);
     println!("  Max tokens: {} ({})", max_tokens_str, default_max_tokens);
     println!("  Temperature: {}", temperature);
     println!("  API model: {}", model);
@@ -413,6 +490,7 @@ let app = Command::new("gchat")
         allow_fd_commands, // Added
         allow_file_writes, // NEW
         &model,
+        &provider,
     )
     .await
     {
@@ -451,6 +529,7 @@ let app = Command::new("gchat")
                 allow_fd_commands, // Added
                 allow_file_writes, // NEW
                 &model,
+                &provider,
             )
             .await
             {
@@ -495,6 +574,7 @@ async fn process_chat_file(
     allow_fd_commands: bool, // Added
     allow_file_writes: bool, // NEW
     model: &str,
+    provider: &str,
 ) -> io::Result<()> {
     // Short debounce to ensure save is complete (helps with atomic saves)
     sleep(Duration::from_millis(500)).await;
@@ -639,14 +719,18 @@ async fn process_chat_file(
         // UPDATED: Conditionally build system content
         let mut system_content = String::new();
         if auto_request_files {
-            system_content.push_str(SYSTEM_INSTRUCTIONS);
+            system_content.push_str(get_system_instructions(provider));
         }
         if allow_file_writes {
-            system_content.push_str(WRITE_INSTRUCTIONS);
+            system_content.push_str(get_write_instructions(provider));
         }
 
         let mut api_messages = messages.clone();  // Clone to avoid mutating original
-        if !system_content.is_empty() {
+        
+        // For Claude, system content goes in a separate field, not as a message
+        if provider == "claude" {
+            // Don't add system message to api_messages for Claude
+        } else if !system_content.is_empty() {
             api_messages.insert(0, Message {
                 role: "system".to_string(),
                 content: system_content,
@@ -654,7 +738,10 @@ async fn process_chat_file(
         }
 
         // Get API key, build client
-        let api_key = env::var("XAI_API_KEY").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "XAI_API_KEY not set"))?;
+        let api_key = match provider {
+            "claude" => env::var("ANTHROPIC_API_KEY").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "ANTHROPIC_API_KEY not set"))?,
+            _ => env::var("XAI_API_KEY").map_err(|_| io::Error::new(io::ErrorKind::NotFound, "XAI_API_KEY not set"))?,
+        };
         let client = Client::builder()
             .timeout(Duration::from_secs(api_timeout))
             .build()
@@ -666,46 +753,77 @@ async fn process_chat_file(
         // Inner loop for handling truncation retries (in-memory, no file re-read)
         let mut needs_reprocess = false;
         loop {
-            // Create request with current max_tokens
-            let req = ChatRequest {
-                model: model.to_string(),
-                messages: api_messages.clone(),  // Clone to keep immutable
-                temperature: local_temperature,
-                max_tokens: parse_level(current_level),
-            };
-
-            // Log the full request (DEBUG level)
-            log::debug!("Sending API request: {:?}", req);
-
             // Build the request
-            let request_builder = client
-                .post("https://api.x.ai/v1/chat/completions")
-                .header("Content-Type", "application/json")
-                .header("Authorization", format!("Bearer {}", api_key))
-                .json(&req);
+            let request_builder = if provider == "claude" {
+                // Create Claude request
+                let claude_req = ClaudeRequest {
+                    model: model.to_string(),
+                    messages: api_messages.clone(),
+                    temperature: local_temperature,
+                    max_tokens: parse_level(current_level),
+                    system: if system_content.is_empty() { None } else { Some(system_content.clone()) },
+                };
+
+                // Log the full request (DEBUG level)
+                log::debug!("Sending Claude API request: {:?}", claude_req);
+
+                client
+                    .post("https://api.anthropic.com/v1/messages")
+                    .header("Content-Type", "application/json")
+                    .header("x-api-key", &api_key)
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&claude_req)
+            } else {
+                // Create Grok request
+                let grok_req = ChatRequest {
+                    model: model.to_string(),
+                    messages: api_messages.clone(),
+                    temperature: local_temperature,
+                    max_tokens: parse_level(current_level),
+                };
+
+                // Log the full request (DEBUG level)
+                log::debug!("Sending Grok API request: {:?}", grok_req);
+
+                client
+                    .post("https://api.x.ai/v1/chat/completions")
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", format!("Bearer {}", api_key))
+                    .json(&grok_req)
+            };
 
             // Play thinking sound
             play_thinking();
 
             // Print thinking message with settings
-            println!("Grok is thinking... (max_tokens: {}, temperature: {})", req.max_tokens, local_temperature);
+            let ai_name = if provider == "claude" { "Claude" } else { "Grok" };
+            println!("{} is thinking... (max_tokens: {}, temperature: {})", ai_name, parse_level(current_level), local_temperature);
 
             // Send and await
             let res = request_builder.send().await;
 
             match res {
                 Ok(resp) if resp.status().is_success() => {
-                    let chat_resp: ChatResponse = resp.json().await.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                    let assistant_content = chat_resp.choices[0].message.content.clone();
-                    let finish_reason = chat_resp.choices[0].finish_reason.clone();
+                    let (assistant_content, finish_reason) = if provider == "claude" {
+                        let claude_resp: ClaudeResponse = resp.json().await.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        let content = claude_resp.content.get(0).map(|c| c.text.clone()).unwrap_or_default();
+                        let finish_reason = claude_resp.stop_reason.clone();
+                        (content, finish_reason)
+                    } else {
+                        let chat_resp: ChatResponse = resp.json().await.map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+                        let content = chat_resp.choices[0].message.content.clone();
+                        let finish_reason = chat_resp.choices[0].finish_reason.clone();
+                        (content, finish_reason)
+                    };
 
                     // UPDATED: Check if this is a file write request (now with path validation against allowed paths and flexible newline parsing)
+                    let write_prefix = if provider == "claude" { "CLAUDE WRITES TO FILE:" } else { "GROK WRITES TO FILE:" };
                     let is_write_request = if allow_file_writes && !allowed_write_paths.is_empty() {
                         let trimmed = assistant_content.trim();
-                        if trimmed.starts_with("GROK WRITES TO FILE:") {
-                            // NEW: Robust parsing for single newline after header (find first \n after "GROK WRITES TO FILE:")
-                            if let Some(nl_pos) = trimmed.find("GROK WRITES TO FILE:").map(|start| {
-                                start + "GROK WRITES TO FILE:".len()
+                        if trimmed.starts_with(write_prefix) {
+                            // NEW: Robust parsing for single newline after header (find first \n after write prefix)
+                            if let Some(nl_pos) = trimmed.find(write_prefix).map(|start| {
+                                start + write_prefix.len()
                             }).and_then(|after_prefix| trimmed[after_prefix..].find('\n').map(|p| after_prefix + p)) {
                                 let header_end = nl_pos + 1;  // After the \n
                                 let header = trimmed[..header_end].trim();
@@ -714,8 +832,8 @@ async fn process_chat_file(
                                 if content.is_empty() {
                                     log::warn!("Write response has empty content after header: {}", header);
                                     false
-                                } else if header.starts_with("GROK WRITES TO FILE:") {
-                                    let path_str = header.strip_prefix("GROK WRITES TO FILE:").unwrap().trim().to_string();
+                                } else if header.starts_with(write_prefix) {
+                                    let path_str = header.strip_prefix(write_prefix).unwrap().trim().to_string();
 
                                     // Validate against allowed paths from user's @w: placeholders
                                     if !allowed_write_paths.contains(&path_str) {
@@ -791,12 +909,13 @@ async fn process_chat_file(
                     }
 
                     // Check if this is a file request (only if flag is enabled)
+                    let file_request_prefix = if provider == "claude" { "CLAUDE REQUESTS FILES:" } else { "GROK REQUESTS FILES:" };
                     let is_file_request = if auto_request_files {
                         let trimmed = assistant_content.trim();
-                        if trimmed.starts_with("GROK REQUESTS FILES:") {
-                            let rest = trimmed.strip_prefix("GROK REQUESTS FILES:").unwrap().trim();
+                        if trimmed.starts_with(file_request_prefix) {
+                            let rest = trimmed.strip_prefix(file_request_prefix).unwrap().trim();
                             // Ensure it's exactly the format (no extra content)
-                            if !rest.is_empty() && trimmed == format!("GROK REQUESTS FILES: {}", rest) {
+                            if !rest.is_empty() && trimmed == format!("{} {}", file_request_prefix, rest) {
                                 let paths: Vec<String> = rest.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
 
                                 // Validate paths (syntactic only: no absolute, no traversal)
@@ -815,7 +934,8 @@ async fn process_chat_file(
                                 if all_valid && !valid_paths.is_empty() {
                                     // Append visible note and placeholders to the END of the file (augments the last USER PROMPT)
                                     let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
-                                    writeln!(file, "\n\nGROK REQUESTED FILES:")?;
+                                    let ai_name = if provider == "claude" { "CLAUDE" } else { "GROK" };
+                                    writeln!(file, "\n\n{} REQUESTED FILES:", ai_name)?;
                                     for vp in valid_paths {
                                         writeln!(file, "@f:{}", vp)?;  // No space after 'f'
                                     }
@@ -837,17 +957,19 @@ async fn process_chat_file(
                     };
 
                     // Check if this is an RG request (only if flag is enabled) -- Added
+                    let rg_prefix = if provider == "claude" { "CLAUDE RUNS RG:" } else { "GROK RUNS RG:" };
                     let is_rg_request = if allow_rg_commands {
                         let trimmed = assistant_content.trim();
-                        if trimmed.starts_with("GROK RUNS RG:") {
-                            let rest = trimmed.strip_prefix("GROK RUNS RG:").unwrap().trim();
-                            if !rest.is_empty() && trimmed == format!("GROK RUNS RG: {}", rest) {
+                        if trimmed.starts_with(rg_prefix) {
+                            let rest = trimmed.strip_prefix(rg_prefix).unwrap().trim();
+                            if !rest.is_empty() && trimmed == format!("{} {}", rg_prefix, rest) {
                                 let cwd = env::current_dir()?;
                                 match run_rg_command(rest, &cwd).await {
                                     Ok(output) => {
                                         // Append to file
                                         let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
-                                        writeln!(file, "\n\nGROK RAN RG: {}\n```\n{}\n```\n", rest, output)?;
+                                        let ai_name = if provider == "claude" { "CLAUDE" } else { "GROK" };
+                                        writeln!(file, "\n\n{} RAN RG: {}\n```\n{}\n```\n", ai_name, rest, output)?;
                                         needs_reprocess = true;  // Set needs_reprocess
                                         true  // Set is_rg_request
                                     }
@@ -868,17 +990,19 @@ async fn process_chat_file(
                     };
 
                     // Check if this is an FD request (only if flag is enabled) -- Added
+                    let fd_prefix = if provider == "claude" { "CLAUDE RUNS FD:" } else { "GROK RUNS FD:" };
                     let is_fd_request = if allow_fd_commands {
                         let trimmed = assistant_content.trim();
-                        if trimmed.starts_with("GROK RUNS FD:") {
-                            let rest = trimmed.strip_prefix("GROK RUNS FD:").unwrap().trim();
-                            if !rest.is_empty() && trimmed == format!("GROK RUNS FD: {}", rest) {
+                        if trimmed.starts_with(fd_prefix) {
+                            let rest = trimmed.strip_prefix(fd_prefix).unwrap().trim();
+                            if !rest.is_empty() && trimmed == format!("{} {}", fd_prefix, rest) {
                                 let cwd = env::current_dir()?;
                                 match run_fd_command(rest, &cwd).await {
                                     Ok(output) => {
                                         // Append to file
                                         let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
-                                        writeln!(file, "\n\nGROK RAN FD: {}\n```\n{}\n```\n", rest, output)?;
+                                        let ai_name = if provider == "claude" { "CLAUDE" } else { "GROK" };
+                                        writeln!(file, "\n\n{} RAN FD: {}\n```\n{}\n```\n", ai_name, rest, output)?;
                                         needs_reprocess = true;  // Set is_fd_request
                                         true  // Set is_fd_request
                                     }
@@ -928,13 +1052,15 @@ async fn process_chat_file(
                     // Otherwise, treat as final response
                     // ------ NEW: Calculate elapsed time ------
                     let elapsed = start_time.elapsed().map(|d| d.as_secs()).unwrap_or(0);
-                    println!("Grok has thought ({} seconds).", elapsed);
+                    let ai_name = if provider == "claude" { "Claude" } else { "Grok" };
+                    println!("{} has thought ({} seconds).", ai_name, elapsed);
 
                     let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
+                    let response_marker = if provider == "claude" { "CLAUDE RESPONSE" } else { GROK_RESPONSE_MARKER };
                     writeln!(
                         file,
                         "\n{}:\n{}\n\n{}:\n",
-                        GROK_RESPONSE_MARKER,
+                        response_marker,
                         assistant_content,
                         USER_PROMPT_MARKER
                     )?;
@@ -953,12 +1079,14 @@ async fn process_chat_file(
                 Ok(resp) => {
                     let status = resp.status();
                     let err_body = resp.text().await.unwrap_or_default();
-                    println!("Grok failed to respond.");
+                    let ai_name = if provider == "claude" { "Claude" } else { "Grok" };
+                    println!("{} failed to respond.", ai_name);
                     play_warning();
                     return Err(io::Error::new(io::ErrorKind::Other, format!("API error: {} - Body: {}", status, err_body)));
                 }
                 Err(e) => {
-                    println!("Grok failed to respond.");
+                    let ai_name = if provider == "claude" { "Claude" } else { "Grok" };
+                    println!("{} failed to respond.", ai_name);
                     play_warning();
                     return Err(io::Error::new(io::ErrorKind::Other, format!("Request error: {:?}", e)));
                 },
@@ -981,7 +1109,7 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
     let mut current_content = String::new();
 
     for line in content.lines() {
-        if line.trim() == "USER PROMPT:" || line.trim() == "GROK RESPONSE:" {
+        if line.trim() == "USER PROMPT:" || line.trim() == "GROK RESPONSE:" || line.trim() == "CLAUDE RESPONSE:" {
             // Add previous section if content is non-empty
             let trimmed = current_content.trim().to_string();
             if !trimmed.is_empty() {
