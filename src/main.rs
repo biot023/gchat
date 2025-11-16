@@ -21,7 +21,7 @@ use toml;
 use shell_words::split; // Added for safe RG and FD command parsing
 use std::collections::HashMap; // NEW: For profiles
 
-const GROK_RESPONSE_MARKER: &str = "GROK RESPONSE";
+const RESPONSE_MARKER: &str = "GCHAT RESPONSE";
 const USER_PROMPT_MARKER: &str = "USER PROMPT";
 const MAX_LEVEL: u32 = 12; // UPDATED: Increased from 7 to 12 for ~2M tokens
 const RG_TIMEOUT_SECS: u64 = 30; // Added for RG command timeout
@@ -29,70 +29,38 @@ const MAX_RG_OUTPUT_BYTES: usize = 50 * 1024; // Added for RG output limit
 const FD_TIMEOUT_SECS: u64 = 30; // Added for FD command timeout
 const MAX_FD_OUTPUT_BYTES: usize = 50 * 1024; // Added for FD output limit
 
-fn get_system_instructions(provider: &str) -> &'static str {
-    match provider {
-        "claude" => r#"
-You are Claude, a helpful AI and coding assistant. **To provide the most accurate and helpful responses, actively request the contents of relevant files whenever you need them to verify assumptions, check details, or gather more context—even if the user hasn't explicitly asked. For example, if a query involves code, configurations, or project structure, request the necessary files proactively.**
+fn get_system_instructions(_provider: &str) -> &'static str {
+    r#"
+You are a helpful AI and coding assistant. **To provide the most accurate and helpful responses, actively request the contents of relevant files whenever you need them to verify assumptions, check details, or gather more context—even if the user hasn't explicitly asked. For example, if a query involves code, configurations, or project structure, request the necessary files proactively.**
 
 If you decide to request files, respond with **EXACTLY** this format and **NOTHING ELSE**:
-CLAUDE REQUESTS FILES: relative/path1, relative/path2
+GCHAT REQUESTS FILES: relative/path1, relative/path2
 Paths must be relative to the current working directory (e.g., src/main.rs, not /absolute/path or ../outside). Do not request files outside the project directory. You can request multiple files, directories, or globs (e.g., src/*.rs). The system will automatically include their contents in the next user message. Request all needed files at once if possible. You may request again if more are needed after seeing the contents.
 
 **Only request files when they are genuinely needed to improve your response. If you have sufficient information, provide a direct answer without requesting.**
 
 To perform grep-like searches on the project, respond with **EXACTLY** this format and **NOTHING ELSE** (chaining until done):
-CLAUDE RUNS RG: rg <safe-args-and-patterns>
-Examples: CLAUDE RUNS RG: rg -i "error" --glob "**/*.rs" --line-number
+GCHAT RUNS RG: rg <safe-args-and-patterns>
+Examples: GCHAT RUNS RG: rg -i "error" --glob "**/*.rs" --line-number
 Use --glob for patterns (e.g., --glob "**/*.rs" for all Rust files recursively). Avoid bare globs like src/*.rs without --glob. Allowed args: common ripgrep flags like -i, -n, --type rust, paths (relative only). No execution or shell metacharacters.
 
 To search for files and directories on the project, respond with **EXACTLY** this format and **NOTHING ELSE** (chaining until done):
-CLAUDE RUNS FD: fd <safe-args-and-patterns>
-Examples: CLAUDE RUNS FD: fd --type f --glob "*.md" --max-depth 2
+GCHAT RUNS FD: fd <safe-args-and-patterns>
+Examples: GCHAT RUNS FD: fd --type f --glob "*.md" --max-depth 2
 Allowed args: common fd flags like --type, --glob, --max-depth, paths (relative only). No execution or shell metacharacters.
-"#,
-        _ => r#"
-You are Grok, a helpful AI and coding assistant. **To provide the most accurate and helpful responses, actively request the contents of relevant files whenever you need them to verify assumptions, check details, or gather more context—even if the user hasn't explicitly asked. For example, if a query involves code, configurations, or project structure, request the necessary files proactively.**
-
-If you decide to request files, respond with **EXACTLY** this format and **NOTHING ELSE**:
-GROK REQUESTS FILES: relative/path1, relative/path2
-Paths must be relative to the current working directory (e.g., src/main.rs, not /absolute/path or ../outside). Do not request files outside the project directory. You can request multiple files, directories, or globs (e.g., src/*.rs). The system will automatically include their contents in the next user message. Request all needed files at once if possible. You may request again if more are needed after seeing the contents.
-
-**Only request files when they are genuinely needed to improve your response. If you have sufficient information, provide a direct answer without requesting.**
-
-To perform grep-like searches on the project, respond with **EXACTLY** this format and **NOTHING ELSE** (chaining until done):
-GROK RUNS RG: rg <safe-args-and-patterns>
-Examples: GROK RUNS RG: rg -i "error" --glob "**/*.rs" --line-number
-Use --glob for patterns (e.g., --glob "**/*.rs" for all Rust files recursively). Avoid bare globs like src/*.rs without --glob. Allowed args: common ripgrep flags like -i, -n, --type rust, paths (relative only). No execution or shell metacharacters.
-
-To search for files and directories on the project, respond with **EXACTLY** this format and **NOTHING ELSE** (chaining until done):
-GROK RUNS FD: fd <safe-args-and-patterns>
-Examples: GROK RUNS FD: fd --type f --glob "*.md" --max-depth 2
-Allowed args: common fd flags like --type, --glob, --max-depth, paths (relative only). No execution or shell metacharacters.
-"#,
-    }
+"#
 }
 
-fn get_write_instructions(provider: &str) -> &'static str {
-    match provider {
-        "claude" => r#"
+fn get_write_instructions(_provider: &str) -> &'static str {
+    r#"
 To write file contents, if the user prompt contains a placeholder like `@w:relative/path` (indicating they want you to generate and provide the full content for that file), respond with **EXACTLY** this format and **NOTHING ELSE**:
-CLAUDE WRITES TO FILE: relative/path
+GCHAT WRITES TO FILE: relative/path
 [full exact content here, with no markdown formatting, code blocks, or extra explanations— just the raw content to write to the file]
 
 The path must exactly match the relative path specified in the `@w:path` placeholder from the user's current prompt (case-sensitive, no modifications). For example, if the user says `@w:src/main.rs`, only use that exact path—do not invent or alter paths.
 
 Paths must be relative to the current working directory (e.g., README.md or src/main.rs, not /absolute/path or ../outside). Do not request writes outside the project directory. The system will validate and write the content safely. Only use this if the user explicitly requests writing to a specific file via the `@w:` placeholder, and only for the exact path they specified.
-**Only respond in this format when genuinely needed to fulfill a write request. Otherwise, provide a normal response."#,
-        _ => r#"
-To write file contents, if the user prompt contains a placeholder like `@w:relative/path` (indicating they want you to generate and provide the full content for that file), respond with **EXACTLY** this format and **NOTHING ELSE**:
-GROK WRITES TO FILE: relative/path
-[full exact content here, with no markdown formatting, code blocks, or extra explanations— just the raw content to write to the file]
-
-The path must exactly match the relative path specified in the `@w:path` placeholder from the user's current prompt (case-sensitive, no modifications). For example, if the user says `@w:src/main.rs`, only use that exact path—do not invent or alter paths.
-
-Paths must be relative to the current working directory (e.g., README.md or src/main.rs, not /absolute/path or ../outside). Do not request writes outside the project directory. The system will validate and write the content safely. Only use this if the user explicitly requests writing to a specific file via the `@w:` placeholder, and only for the exact path they specified.
-**Only respond in this format when genuinely needed to fulfill a write request. Otherwise, provide a normal response."#,
-    }
+**Only respond in this format when genuinely needed to fulfill a write request. Otherwise, provide a normal response."#
 }
 
 const DEFAULT_CHAT_FILE: &str = "./gchat.md";
@@ -180,16 +148,16 @@ async fn main() -> io::Result<()> {
     // UPDATED: CLI app with profile arg and temperature short changed to 'P'
 let app = Command::new("gchat")
     .version(env!("CARGO_PKG_VERSION"))
-    .about("Chat with Grok effortlessly! A friendly Rust tool for interactive conversations via a Markdown file.")
+    .about("Chat with AI effortlessly! A friendly Rust tool for interactive conversations via a Markdown file.")
     .long_about(
-        "Hey there! 🚀 This is gchat, your handy helper for chatting with Grok 4 (from xAI) right from your favorite text editor.\n\n".to_string() +
+        "Hey there! 🚀 This is gchat, your handy helper for chatting with AI (Grok 4 from xAI or Claude from Anthropic) right from your favorite text editor.\n\n".to_string() +
         "Just edit a Markdown file (like ./gchat.md), add your questions, and watch it magically turn into full conversations. It's perfect for developers, writers, or anyone who loves file-based workflows.\n\n" +
         "Features include:\n" +
         "  - File watching: No need to switch windows—poll for changes every second.\n" +
         "  - Smart placeholders: Include code or files with @f: or @d: (e.g., @f:src/main.rs).\n" +
         "  - Audio vibes: Chime on success, warning tones if things go sideways.\n" +
-        "  - Optional superpowers: Auto-request files, run safe searches (RG/FD), or even let Grok edit your project files!\n\n" +
-        "Get started: Run gchat, edit ./gchat.md, and add 'USER PROMPT: Hello, Grok!'. Happy chatting! 🤖✨"
+        "  - Optional superpowers: Auto-request files, run safe searches (RG/FD), or even let AI edit your project files!\n\n" +
+        "Get started: Run gchat, edit ./gchat.md, and add 'USER PROMPT: Hello!'. Happy chatting! 🤖✨"
     )
         .arg(
             Arg::new("chat_file")
@@ -235,7 +203,7 @@ let app = Command::new("gchat")
             Arg::new("auto_request_files")
                 .short('a')
                 .long("auto-request-files")
-                .help("Enable Grok to automatically request and include project files")
+                .help("Enable AI to automatically request and include project files")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -249,21 +217,21 @@ let app = Command::new("gchat")
             Arg::new("allow_rg_commands")
                 .short('r')
                 .long("allow-rg-commands")
-                .help("Allow Grok to run safe ripgrep commands on the project")
+                .help("Allow AI to run safe ripgrep commands on the project")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg( // Added
             Arg::new("allow_fd_commands")
                 .short('d')
                 .long("allow-fd-commands")
-                .help("Allow Grok to run safe fd commands on the project")
+                .help("Allow AI to run safe fd commands on the project")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg( // NEW
             Arg::new("allow_file_writes")
                 .short('w')
                 .long("allow-file-writes")
-                .help("Allow Grok to write generated content to project files via special responses")
+                .help("Allow AI to write generated content to project files via special responses")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg( // NEW: Profile arg
@@ -703,7 +671,7 @@ async fn process_chat_file(
 
         // If there were any expansion errors, play warning sound and notify user with failed paths
         if any_expansion_error {
-            println!("Warning: Issues encountered while expanding placeholders. Details are included in the prompt sent to Grok.");
+            println!("Warning: Issues encountered while expanding placeholders. Details are included in the prompt sent to AI.");
             if !all_failed_paths.is_empty() {
                 println!("Failed to expand placeholders for files/directories:");
                 for path in &all_failed_paths {
@@ -733,7 +701,7 @@ async fn process_chat_file(
         } else if !system_content.is_empty() {
             api_messages.insert(0, Message {
                 role: "system".to_string(),
-                content: system_content,
+                content: system_content.clone(),
             });
         }
 
@@ -817,7 +785,7 @@ async fn process_chat_file(
                     };
 
                     // UPDATED: Check if this is a file write request (now with path validation against allowed paths and flexible newline parsing)
-                    let write_prefix = if provider == "claude" { "CLAUDE WRITES TO FILE:" } else { "GROK WRITES TO FILE:" };
+                    let write_prefix = "GCHAT WRITES TO FILE:";
                     let is_write_request = if allow_file_writes && !allowed_write_paths.is_empty() {
                         let trimmed = assistant_content.trim();
                         if trimmed.starts_with(write_prefix) {
@@ -837,7 +805,7 @@ async fn process_chat_file(
 
                                     // Validate against allowed paths from user's @w: placeholders
                                     if !allowed_write_paths.contains(&path_str) {
-                                        log::warn!("Grok requested write to '{}', but it doesn't match any @w: path in user prompt ('{:?}'). Treating as normal response.", path_str, allowed_write_paths);
+                                        log::warn!("AI requested write to '{}', but it doesn't match any @w: path in user prompt ('{:?}'). Treating as normal response.", path_str, allowed_write_paths);
                                         false
                                     } else {
                                         log::debug!("Detected valid write request for path: {}", path_str);
@@ -871,7 +839,7 @@ async fn process_chat_file(
                                                             .open(chat_path)
                                                             .and_then(|mut f| {
                                                                 writeln!(f, "\n{}:\nGenerated and overwrote content in {}.\n(Full content saved to the file; check it there.)\n\n{}:\n",
-                                                                    GROK_RESPONSE_MARKER, path.display(), USER_PROMPT_MARKER)?;
+                                                                    RESPONSE_MARKER, path.display(), USER_PROMPT_MARKER)?;
                                                                 Ok(())
                                                             })
                                                         {
@@ -892,7 +860,7 @@ async fn process_chat_file(
                                     false
                                 }
                             } else {
-                                log::warn!("Write response missing newline after 'GROK WRITES TO FILE:': {}", trimmed);
+                                log::warn!("Write response missing newline after 'GCHAT WRITES TO FILE:': {}", trimmed);
                                 false
                             }
                         } else {
@@ -909,7 +877,7 @@ async fn process_chat_file(
                     }
 
                     // Check if this is a file request (only if flag is enabled)
-                    let file_request_prefix = if provider == "claude" { "CLAUDE REQUESTS FILES:" } else { "GROK REQUESTS FILES:" };
+                    let file_request_prefix = "GCHAT REQUESTS FILES:";
                     let is_file_request = if auto_request_files {
                         let trimmed = assistant_content.trim();
                         if trimmed.starts_with(file_request_prefix) {
@@ -934,8 +902,7 @@ async fn process_chat_file(
                                 if all_valid && !valid_paths.is_empty() {
                                     // Append visible note and placeholders to the END of the file (augments the last USER PROMPT)
                                     let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
-                                    let ai_name = if provider == "claude" { "CLAUDE" } else { "GROK" };
-                                    writeln!(file, "\n\n{} REQUESTED FILES:", ai_name)?;
+                                    writeln!(file, "\n\nGCHAT REQUESTED FILES:")?;
                                     for vp in valid_paths {
                                         writeln!(file, "@f:{}", vp)?;  // No space after 'f'
                                     }
@@ -957,7 +924,7 @@ async fn process_chat_file(
                     };
 
                     // Check if this is an RG request (only if flag is enabled) -- Added
-                    let rg_prefix = if provider == "claude" { "CLAUDE RUNS RG:" } else { "GROK RUNS RG:" };
+                    let rg_prefix = "GCHAT RUNS RG:";
                     let is_rg_request = if allow_rg_commands {
                         let trimmed = assistant_content.trim();
                         if trimmed.starts_with(rg_prefix) {
@@ -968,8 +935,7 @@ async fn process_chat_file(
                                     Ok(output) => {
                                         // Append to file
                                         let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
-                                        let ai_name = if provider == "claude" { "CLAUDE" } else { "GROK" };
-                                        writeln!(file, "\n\n{} RAN RG: {}\n```\n{}\n```\n", ai_name, rest, output)?;
+                                        writeln!(file, "\n\nGCHAT RAN RG: {}\n```\n{}\n```\n", rest, output)?;
                                         needs_reprocess = true;  // Set needs_reprocess
                                         true  // Set is_rg_request
                                     }
@@ -990,7 +956,7 @@ async fn process_chat_file(
                     };
 
                     // Check if this is an FD request (only if flag is enabled) -- Added
-                    let fd_prefix = if provider == "claude" { "CLAUDE RUNS FD:" } else { "GROK RUNS FD:" };
+                    let fd_prefix = "GCHAT RUNS FD:";
                     let is_fd_request = if allow_fd_commands {
                         let trimmed = assistant_content.trim();
                         if trimmed.starts_with(fd_prefix) {
@@ -1001,8 +967,7 @@ async fn process_chat_file(
                                     Ok(output) => {
                                         // Append to file
                                         let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
-                                        let ai_name = if provider == "claude" { "CLAUDE" } else { "GROK" };
-                                        writeln!(file, "\n\n{} RAN FD: {}\n```\n{}\n```\n", ai_name, rest, output)?;
+                                        writeln!(file, "\n\nGCHAT RAN FD: {}\n```\n{}\n```\n", rest, output)?;
                                         needs_reprocess = true;  // Set is_fd_request
                                         true  // Set is_fd_request
                                     }
@@ -1056,11 +1021,10 @@ async fn process_chat_file(
                     println!("{} has thought ({} seconds).", ai_name, elapsed);
 
                     let mut file = fs::OpenOptions::new().append(true).open(chat_path)?;
-                    let response_marker = if provider == "claude" { "CLAUDE RESPONSE" } else { GROK_RESPONSE_MARKER };
                     writeln!(
                         file,
                         "\n{}:\n{}\n\n{}:\n",
-                        response_marker,
+                        RESPONSE_MARKER,
                         assistant_content,
                         USER_PROMPT_MARKER
                     )?;
@@ -1109,7 +1073,7 @@ fn parse_chat_messages(content: &str) -> Vec<Message> {
     let mut current_content = String::new();
 
     for line in content.lines() {
-        if line.trim() == "USER PROMPT:" || line.trim() == "GROK RESPONSE:" || line.trim() == "CLAUDE RESPONSE:" {
+        if line.trim() == "USER PROMPT:" || line.trim() == "GCHAT RESPONSE:" {
             // Add previous section if content is non-empty
             let trimmed = current_content.trim().to_string();
             if !trimmed.is_empty() {
@@ -1191,7 +1155,7 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
                 if files.is_empty() {
                     had_error = true;
                     failed_paths.push(path_str.to_string()); // Add failed glob pattern
-                    let _ = writeln!(output, "No files matched the pattern {}.\n", path_str);
+                    let _ = writeln!(output, "[EXPANSION ERROR] No files matched the glob pattern '{}'", path_str);
                 } else {
                     files.sort();
                     for p in files {
@@ -1204,14 +1168,14 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
                                     Err(e) => {
                                         had_error = true;
                                         failed_paths.push(p.display().to_string()); // Add failed file
-                                        let _ = writeln!(output, "Failed to read file {}: {}.\n", p.display(), e);
+                                        let _ = writeln!(output, "[EXPANSION ERROR] Cannot read file '{}': {}", p.display(), e);
                                     }
                                 }
                             }
                             _ => {
                                 had_error = true;
                                 failed_paths.push(p.display().to_string()); // Add invalid/outside file
-                                let _ = writeln!(output, "The requested file {} is unavailable (outside project or invalid).\n", p.display());
+                                let _ = writeln!(output, "[EXPANSION ERROR] File '{}' is outside project scope or inaccessible", p.display());
                             }
                         }
                     }
@@ -1220,7 +1184,7 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
             Err(e) => {
                 had_error = true;
                 failed_paths.push(path_str.to_string()); // Add invalid glob pattern
-                let _ = writeln!(output, "Invalid glob pattern {}: {}.\n", path_str, e);
+                let _ = writeln!(output, "[EXPANSION ERROR] Invalid glob pattern '{}': {}", path_str, e);
             }
         }
     } else if path.is_dir() {
@@ -1228,17 +1192,17 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
         if !path.exists() {
             had_error = true;
             failed_paths.push(path_str.to_string()); // Add non-existent directory
-            let _ = writeln!(output, "The requested directory {} does not exist.\n", path_str);
+            let _ = writeln!(output, "[EXPANSION ERROR] Directory '{}' does not exist", path_str);
         } else if !path.is_dir() {
             had_error = true;
             failed_paths.push(path_str.to_string()); // Add invalid (not a dir)
-            let _ = writeln!(output, "The path {} is not a directory.\n", path_str);
+            let _ = writeln!(output, "[EXPANSION ERROR] Path '{}' is not a directory", path_str);
         } else {
             match path.canonicalize() {
                 Ok(canon) if canon.starts_with(cwd) => {
                     let mut entries: Vec<_> = WalkDir::new(path).into_iter().filter_map(|e| e.ok()).filter(|e| e.file_type().is_file()).collect();
                     if entries.is_empty() {
-                        let _ = writeln!(output, "No files found in directory {}.\n", path.display());
+                        let _ = writeln!(output, "Directory '{}' contains no files", path.display());
                         // Note: Not considering empty dir as error
                     } else {
                         entries.sort_by_key(|e| e.path().to_owned());
@@ -1253,14 +1217,14 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
                                         Err(e) => {
                                             had_error = true;
                                             failed_paths.push(ep.display().to_string()); // Add failed file in dir
-                                            let _ = writeln!(output, "Failed to read file {}: {}.\n", ep.display(), e);
+                                            let _ = writeln!(output, "[EXPANSION ERROR] Cannot read file '{}' in directory: {}", ep.display(), e);
                                         }
                                     }
                                 }
                                 _ => {
                                     had_error = true;
                                     failed_paths.push(ep.display().to_string()); // Add invalid file in dir
-                                    let _ = writeln!(output, "The requested file {} is unavailable.\n", ep.display());
+                                    let _ = writeln!(output, "[EXPANSION ERROR] File '{}' is outside project scope", ep.display());
                                 }
                             }
                         }
@@ -1269,7 +1233,7 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
                 _ => {
                     had_error = true;
                     failed_paths.push(path_str.to_string()); // Add invalid/outside directory
-                    let _ = writeln!(output, "The requested directory {} is unavailable (outside project or invalid).\n", path_str);
+                    let _ = writeln!(output, "[EXPANSION ERROR] Directory '{}' is outside project scope or inaccessible", path_str);
                 }
             }
         }
@@ -1284,7 +1248,7 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
                     Err(e) => {
                         had_error = true;
                         failed_paths.push(path_str.to_string()); // Add failed single file
-                        let _ = writeln!(output, "Failed to read file {}: {}.\n", path.display(), e);
+                        let _ = writeln!(output, "[EXPANSION ERROR] Cannot read file '{}': {}", path.display(), e);
                     }
                 }
             }
@@ -1292,7 +1256,7 @@ fn expand_file_path(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
                 // Covers not found, outside project, etc.
                 had_error = true;
                 failed_paths.push(path_str.to_string()); // Add missing/invalid single file
-                let _ = writeln!(output, "The requested file {} does not exist or is unavailable.\n", path_str);
+                let _ = writeln!(output, "[EXPANSION ERROR] File '{}' not found or outside project scope", path_str);
             }
         }
     }
@@ -1308,12 +1272,12 @@ fn expand_dir_tree(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
     if !path.exists() {
         had_error = true;
         failed_paths.push(path_str.to_string()); // Add non-existent directory
-        return (format!("The requested directory {} does not exist.\n", path_str), had_error, failed_paths);
+        return (format!("[EXPANSION ERROR] Directory '{}' does not exist", path_str), had_error, failed_paths);
     }
     if !path.is_dir() {
         had_error = true;
         failed_paths.push(path_str.to_string()); // Add invalid (not a dir)
-        return (format!("The path {} is not a directory.\n", path_str), had_error, failed_paths);
+        return (format!("[EXPANSION ERROR] Path '{}' is not a directory", path_str), had_error, failed_paths);
     }
 
     match path.canonicalize() {
@@ -1341,7 +1305,7 @@ fn expand_dir_tree(path_str: &str, cwd: &Path) -> (String, bool, Vec<String>) {
         _ => {
             had_error = true;
             failed_paths.push(path_str.to_string()); // Add invalid/outside directory
-            (format!("The requested directory {} is unavailable (outside project or invalid).\n", path_str), had_error, failed_paths)
+            (format!("[EXPANSION ERROR] Directory '{}' is outside project scope or inaccessible", path_str), had_error, failed_paths)
         }
     }
 }
@@ -1518,7 +1482,7 @@ fn play_warning() {
             sink.sleep_until_end();
             Ok(())
         }).await {
-            log::error!("Failed to spawn or complete warning sound playback: {}", e);
+            log::error!("Failed to spawn or complete thinking sound playback: {}", e);
         }
     });
 }
