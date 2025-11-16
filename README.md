@@ -1,8 +1,8 @@
-# gchat: Interactive Grok AI Chat Tool for Developers
+# gchat: Interactive AI Chat Tool for Developers
 
-A powerful, file-based Rust utility for seamless conversations with Grok AI (from xAI). Designed for developers, writers, and anyone who prefers editing a Markdown file in their favorite text editor over web interfaces or traditional CLI prompts. `gchat` polls a chat file for changes, expands placeholders for context (files, directories, parameters), sends prompts to the Grok API, and appends responses—complete with audio feedback, optional chaining features, and strict safety checks.
+A powerful, file-based Rust utility for seamless conversations with AI assistants including Grok AI (from xAI) and Claude (from Anthropic). Designed for developers, writers, and anyone who prefers editing a Markdown file in their favorite text editor over web interfaces or traditional CLI prompts. `gchat` polls a chat file for changes, expands placeholders for context (files, directories, parameters), sends prompts to your chosen AI API, and appends responses—complete with audio feedback, optional chaining features, and strict safety checks.
 
-This tool transforms your text editor into a collaborative AI workspace. Edit the chat file to ask questions, include code snippets, or request analyses, and let `gchat` handle the API integration, file expansions, and response management. It's especially suited for coding tasks, where embedding project files or running safe searches provides deep, accurate assistance.
+This tool transforms your text editor into a collaborative AI workspace. Edit the chat file to ask questions, include code snippets, or request analyses, and let `gchat` handle the API integration, file expansions, and response management. It's especially suited for coding tasks, where embedding project files or running safe searches provides deep, accurate assistance from either Grok or Claude.
 
 ## Table of Contents
 - [Overview](#overview)
@@ -24,26 +24,27 @@ This tool transforms your text editor into a collaborative AI workspace. Edit th
 `gchat` is a single-binary Rust application that monitors a Markdown chat file (default: `./gchat.md`) for modifications. When a new user prompt is detected (marked by "USER PROMPT:"), it:
 1. Parses the file into a conversation history.
 2. Expands placeholders in user messages (e.g., `@f:src/main.rs` to include file contents).
-3. Sends the history to the Grok API with configurable parameters (model, max_tokens, temperature).
-4. Appends the AI response (marked by "GROK RESPONSE:") and a new "USER PROMPT:" section.
+3. Sends the history to your chosen AI API (Grok or Claude) with configurable parameters (model, max_tokens, temperature).
+4. Appends the AI response (marked by "GROK RESPONSE:" or "CLAUDE RESPONSE:") and a new "USER PROMPT:" section.
 5. Provides audio cues: a chime for success, tones for warnings.
 
-The app runs indefinitely, polling every 1 second, making it feel like a live editor session. It supports optional "superpowers" like letting Grok request files, run safe ripgrep (rg) searches, or even write to project files—enabled via flags for security.
+The app runs indefinitely, polling every 1 second, making it feel like a live editor session. It supports optional "superpowers" like letting the AI request files, run safe ripgrep (rg) searches, or even write to project files—enabled via flags for security.
 
 Built with async Rust using `tokio`, `reqwest` for API calls, and libraries like `clap` (CLI), `regex` (placeholders), `rodio` (audio), and `walkdir` (directory handling). It prioritizes safety: no shell execution, path traversal blocked, and all expansions within the project directory.
 
 ## Key Features
+- **Multi-Provider Support**: Choose between Grok AI (xAI) and Claude (Anthropic) with identical functionality.
 - **File-Based Workflow**: No UI—just edit a Markdown file in your editor (e.g., VS Code, Vim, Neovim). Changes trigger API calls automatically.
 - **Placeholder Expansion**: Embed file contents, directory trees, or override AI parameters directly in prompts (e.g., `@f:Cargo.toml` includes the file, `@t:L3` sets max tokens).
 - **Conversation History**: Maintains full context by sending all prior user/assistant exchanges.
 - **Audio Feedback**: Built-in sounds for status (chime on success, descending tones on errors) using `rodio` and MP3 files.
-- **Configurable Parameters**: Override defaults for model, max_tokens (via levels), temperature, timeout, etc., per-prompt or globally.
-- **Profiles Support**: Use TOML config with named profiles (e.g., "default" for quick chats, "x" for heavy reasoning).
+- **Configurable Parameters**: Override defaults for provider, model, max_tokens (via levels), temperature, timeout, etc., per-prompt or globally.
+- **Profiles Support**: Use TOML config with named profiles (e.g., "default" for quick chats, "claude" for Claude, "x" for heavy reasoning).
 - **Truncation Handling**: Detects API truncation and optionally auto-retries with higher token limits.
 - **Optional Advanced Modes**:
-  - Auto-request files: Grok can ask for project files to improve responses.
-  - Safe RG/FD Commands: Grok runs whitelisted ripgrep or fd-find searches for context.
-  - File Writes: Grok can generate/overwrite files in your project via user-approved placeholders.
+  - Auto-request files: AI can ask for project files to improve responses.
+  - Safe RG/FD Commands: AI runs whitelisted ripgrep or fd-find searches for context.
+  - File Writes: AI can generate/overwrite files in your project via user-approved placeholders.
 - **Safety-First Design**: Validates all paths (relative only, no traversal); whitelists commands; timeouts and output limits prevent abuse.
 - **Logging**: Detailed debug logs (set `RUST_LOG=debug`) for requests/responses, expansions, and errors.
 - **Debounce and Polling**: 500ms debounce after detection to handle saves; 1s polling for efficiency.
@@ -63,7 +64,10 @@ Sounds are non-blocking and use bundled media (`media/thinking.mp3`, `media/chim
 ## Installation
 ### Prerequisites
 - **Rust**: Version 1.70+ (install via [rustup.rs](https://rustup.rs/)).
-- **Grok API Key**: Obtain from [x.ai](https://x.ai) and set as `export XAI_API_KEY=your-key-here` (add to `~/.bashrc` or similar for persistence).
+- **API Keys**: 
+  - **For Grok**: Obtain from [x.ai](https://x.ai) and set as `export XAI_API_KEY=your-key-here`
+  - **For Claude**: Obtain from [console.anthropic.com](https://console.anthropic.com) and set as `export ANTHROPIC_API_KEY=your-key-here`
+  - Add to `~/.bashrc` or similar for persistence.
 - **Audio (Optional but Recommended)**: For Linux, install `libasound2-dev` and `pkg-config` (`sudo apt install libasound2-dev pkg-config`). macOS/Windows: Usually works out-of-the-box with `rodio`.
 - **Optional Tools**: `ripgrep` (rg) and `fd-find` (fd) for RG/FD features (install via package manager, e.g., `sudo apt install ripgrep fd-find`).
 
@@ -76,12 +80,13 @@ Sounds are non-blocking and use bundled media (`media/thinking.mp3`, `media/chim
 Configured via CLI flags, a global TOML file (`~/.config/gchat/config.toml`), or both (CLI overrides config). Profiles allow switching setups (e.g., fast vs. reasoning mode).
 
 ### TOML Config File
-Located at `~/.config/gchat/config.toml` (create if missing). Supports profiles as TOML tables (e.g., `[default]`, `[x]`). Non-profiled configs (legacy) default to `[default]`.
+Located at `~/.config/gchat/config.toml` (create if missing). Supports profiles as TOML tables (e.g., `[default]`, `[claude]`, `[x]`). Non-profiled configs (legacy) default to `[default]`.
 
 Example:
 ```toml
 [default]
 chat_file = "./gchat.md"
+provider = "grok"
 max_tokens = "L3"  # 4096 tokens
 temperature = 1.0
 model = "grok-code-fast-1"
@@ -92,8 +97,22 @@ allow_rg_commands = false
 allow_fd_commands = false
 allow_file_writes = false
 
+[claude]  # Claude profile
+chat_file = "./gchat.md"
+provider = "claude"
+max_tokens = "L4"  # 8192 tokens
+temperature = 0.8
+model = "claude-3-5-sonnet-20241022"
+api_timeout = 600
+auto_request_files = true
+auto_increase_max_tokens = true
+allow_rg_commands = true
+allow_fd_commands = true
+allow_file_writes = false
+
 [x]  # High-power profile for code reasoning
 chat_file = "./gchat.md"
+provider = "grok"
 max_tokens = "L12"  # ~2M tokens
 temperature = 0.7
 model = "grok-4-fast-reasoning"
@@ -108,26 +127,45 @@ allow_file_writes = false
 ### CLI Flags
 Run `cargo run --release -- --help` for full list. Key flags:
 - `-f, --chat-file <PATH>`: Chat file path (default: `./gchat.md`).
+- `--provider <STRING>`: AI provider: 'grok' or 'claude' (default: 'grok').
 - `-t, --max_tokens <LEVEL>`: Default max_tokens level (default: `L3`, 4096 tokens). Overrides config.
 - `-P, --temperature <FLOAT>`: Default temperature (0.0-2.0, default: 1.0).
-- `-m, --model <STRING>`: Grok model (default: `grok-code-fast-1`).
+- `-m, --model <STRING>`: AI model (default depends on provider).
 - `--api-timeout <SECONDS>`: Request timeout (default: 600).
-- `-a, --auto-request-files`: Enable Grok file requests.
+- `-a, --auto-request-files`: Enable AI file requests.
 - `-i, --auto-increase-max-tokens`: Auto-retry on truncation (up to L12).
 - `-r, --allow-rg-commands`: Enable safe RG commands.
 - `-d, --allow-fd-commands`: Enable safe FD commands.
 - `-w, --allow-file-writes`: Enable file writes via `@w:` placeholders.
-- `-p, --profile <NAME>`: Load profile from config (e.g., `-p x`).
+- `-p, --profile <NAME>`: Load profile from config (e.g., `-p claude`).
 
 If no profile specified, uses `[default]` or first profile. No config? Pure defaults.
 
 ## Usage
-1. **Setup**: `export XAI_API_KEY=...` and optionally `export RUST_LOG=debug`.
-2. **Start**: `cargo run --release -- -a -r -d -w -p x` (enable all features, use profile "x").
+1. **Setup**: Set your API key(s):
+   - For Grok: `export XAI_API_KEY=your-grok-key`
+   - For Claude: `export ANTHROPIC_API_KEY=your-claude-key`
+   - Optionally: `export RUST_LOG=debug` for detailed logging.
+2. **Start**: 
+   - Grok: `cargo run --release -- -a -r -d -w -p x` (enable all features, use profile "x")
+   - Claude: `cargo run --release -- --provider claude -a -r -d -w` (use Claude with all features)
+   - Or use profiles: `cargo run --release -- -p claude`
 3. **Edit Chat File**: Open `./gchat.md`. Add prompts under "USER PROMPT:", include placeholders, save. Tool detects change, processes, appends response.
 4. **Interact**: Modify the new "USER PROMPT:" section, repeat. Delete history to shorten contexts for faster processing.
 
 Example `./gchat.md` after processing:
+```
+USER PROMPT:
+Hello, Claude! @f:src/main.rs
+
+CLAUDE RESPONSE:
+Hello! I see your main.rs file...
+
+USER PROMPT:
+Now analyze the code.
+```
+
+Or with Grok:
 ```
 USER PROMPT:
 Hello, Grok! @f:src/main.rs
@@ -140,7 +178,7 @@ Now analyze the code.
 ```
 
 - Starts immediately if prompt exists.
-- Prints status: "Grok is thinking... (max_tokens: 4096, temperature: 1.0)", then "Grok has thought (X seconds)."
+- Prints status: "Claude is thinking... (max_tokens: 4096, temperature: 1.0)" or "Grok is thinking...", then "Claude has thought (X seconds)."
 - Errors: Print to console, log details, play warning sound.
 
 ## Placeholders and Syntax
@@ -171,19 +209,19 @@ Failed expansions note paths in warnings, included in prompt to API.
 
 ## Advanced Features
 ### Auto File Requests
-Enable with `-a`. Grok can request files for better answers via "GROK REQUESTS FILES: path1,path2" (exact format). Tool validates (relative, no traversal), appends placeholders to chat file (e.g., `@f:path1\n@f:path2`), re-processes. Chains until normal response. Security: Blocks invalid paths.
+Enable with `-a`. The AI can request files for better answers via "GROK REQUESTS FILES: path1,path2" or "CLAUDE REQUESTS FILES: path1,path2" (exact format). Tool validates (relative, no traversal), appends placeholders to chat file (e.g., `@f:path1\n@f:path2`), re-processes. Chains until normal response. Security: Blocks invalid paths.
 
 ### Auto-Increase Max Tokens
 Enable with `-i`. On truncation (finish_reason: "max_tokens"), retries with next level (up to L12). In-memory, no file changes until success. Warns if still truncated.
 
 ### RG Commands
-Enable with `-r`. Grok runs "GROK RUNS RG: rg [whitelisted-args]" (e.g., `rg -i "fn" --glob "**/*.rs" -n`). Tool parses safely (using `shell-words`), executes in project root, limits output to 50KB, appends fenced block to file, re-processes. Whitelist: `-i`, `-n`, `--glob`, `--type`, etc. Forbids metachars, absolutes.
+Enable with `-r`. The AI runs "GROK RUNS RG: rg [whitelisted-args]" or "CLAUDE RUNS RG: rg [whitelisted-args]" (e.g., `rg -i "fn" --glob "**/*.rs" -n`). Tool parses safely (using `shell-words`), executes in project root, limits output to 50KB, appends fenced block to file, re-processes. Whitelist: `-i`, `-n`, `--glob`, `--type`, etc. Forbids metachars, absolutes.
 
 ### FD Commands
-Enable with `-d`. Similar to RG: "GROK RUNS FD: fd [args]" (e.g., `fd --type f --glob "*.md"`). For file/directory searches. Same safety/limits.
+Enable with `-d`. Similar to RG: "GROK RUNS FD: fd [args]" or "CLAUDE RUNS FD: fd [args]" (e.g., `fd --type f --glob "*.md"`). For file/directory searches. Same safety/limits.
 
 ### File Writes
-Enable with `-w`. Grok generates files via "GROK WRITES TO FILE: path\n[content]" (must match user's `@w:path` from prompt). Tool overwrites (creates dirs if needed), appends confirmation to chat (but not full content). Validates paths strictly.
+Enable with `-w`. The AI generates files via "GROK WRITES TO FILE: path\n[content]" or "CLAUDE WRITES TO FILE: path\n[content]" (must match user's `@w:path` from prompt). Tool overwrites (creates dirs if needed), appends confirmation to chat (but not full content). Validates paths strictly.
 
 Chaining: File requests, RG/FD, or retries can loop multiple times.
 
@@ -219,13 +257,14 @@ Your main.rs defines... and the directory has...
 USER PROMPT:
 Find all fn main definitions.
 
-GROK RESPONSE:
-GROK RUNS RG: rg -i "fn main" --glob "**/*.rs" -n
+CLAUDE RESPONSE:
+CLAUDE RUNS RG: rg -i "fn main" --glob "**/*.rs" -n
 ```
 Tool appends output, re-processes.
 
 ## Troubleshooting
-- **No Response/API Error**: Check API key, internet, model existence. Logs show details (`RUST_LOG=debug`).
+- **No Response/API Error**: Check API key (XAI_API_KEY for Grok, ANTHROPIC_API_KEY for Claude), internet, model existence. Logs show details (`RUST_LOG=debug`).
+- **Wrong Provider**: Ensure you're using the correct API key for your chosen provider.
 - **Placeholder Failures**: Verify paths exist/relative. Warnings list failed paths.
 - **Sounds Not Playing**: Check audio drivers; remove `rodio` calls if unwanted.
 - **Truncation**: Increase default level or enable `-i`.
@@ -241,4 +280,4 @@ Tool appends output, re-processes.
 ## License
 [Specify if applicable, e.g., MIT] - Open-source Rust project. No warranty.
 
-Enjoy coding with Grok—edit, expand, iterate! 🚀🤖
+Enjoy coding with AI—edit, expand, iterate! 🚀🤖
